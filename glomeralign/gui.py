@@ -1,14 +1,22 @@
+import sys
 import os
+
+# Force UTF-8 on Windows consoles (cp1252 default can't encode many Unicode chars
+# that napari uses in its error notifications, causing a secondary crash in the logger).
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import numpy as np
 import pandas as pd
 import yaml
 from tifffile import imread, imwrite
 from scipy.ndimage import rotate
 from skimage.measure import regionprops_table
-#
 import napari
-from qtpy.QtWidgets import (
-    QPushButton, QVBoxLayout, QWidget, QFileDialog, QInputDialog, QDialog, 
+from PyQt5.QtWidgets import (
+    QPushButton, QVBoxLayout, QWidget, QFileDialog, QInputDialog, QDialog,
     QScrollArea, QCheckBox, QDialogButtonBox, QHBoxLayout, QMessageBox
 )
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -21,11 +29,22 @@ os.makedirs(MATCHES_DIR, exist_ok=True)
 # Global config variable
 CONFIG = {}
 
-def load_global_config(config_path="./config/config.yaml"):
+def _get_scale(ndim):
+    """Return a scale tuple (z, y, x) or (y, x) from config, defaulting to 1.0."""
+    scale_cfg = CONFIG.get('scale', {})
+    xy = float(scale_cfg.get('xy', 1.0))
+    z = float(scale_cfg.get('z', 1.0))
+    if ndim == 2:
+        return (xy, xy)
+    return (z, xy, xy)
+
+def load_global_config(config_path=None):
     """Load configuration file into global CONFIG variable"""
     global CONFIG
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
     try:
-        with open(config_path, 'r') as file:
+        with open(config_path, 'r', encoding='utf-8') as file:
             CONFIG = yaml.safe_load(file)
         print(f"Config loaded from {config_path}")
         print(f"Config data: {CONFIG}")
@@ -192,45 +211,51 @@ class ImageLoader(QWidget):
         
         # Determine which data to load based on viewer type
         if self.viewer_type == 'exvivo':
-            # Load in vivo images
-            if os.path.exists(models['exvivo_slices']):
-                image_data = imread(models['exvivo_slices'])
+            exvivo_slices = models.get('exvivo_slices', '')
+            if exvivo_slices and os.path.exists(exvivo_slices):
+                image_data = imread(exvivo_slices)
                 self.loaded_layer_name = 'Loaded Image'
-                self.viewer.add_image(image_data, name=self.loaded_layer_name, opacity=1)
-                print(f"Loaded in vivo stack from {models['exvivo_slices']}")
-                
-            # Load in vivo segmentation if available
-            if os.path.exists(models['exvivo_segmentation']):
-                mask_data = imread(models['exvivo_segmentation'])
-                mask_layer = self.viewer.add_labels(mask_data, name='Mask', opacity=0.3)
-                print(f"Loaded in vivo segmentation from {models['exvivo_segmentation']}")
-                
+                self.viewer.add_image(image_data, name=self.loaded_layer_name, opacity=1,
+                                      scale=_get_scale(image_data.ndim))
+                print(f"Loaded ex vivo stack from {exvivo_slices}")
+
+            exvivo_seg = models.get('exvivo_segmentation', '')
+            if exvivo_seg and os.path.exists(exvivo_seg):
+                mask_data = imread(exvivo_seg)
+                self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
+                                       scale=_get_scale(mask_data.ndim))
+                print(f"Loaded ex vivo segmentation from {exvivo_seg}")
+
         elif self.viewer_type == 'invivo':
-            # Load ex vivo slices
-            if os.path.exists(models['invivo_slices']):
-                slices = imread(models['invivo_slices'])
+            invivo_slices = models.get('invivo_slices', '')
+            if invivo_slices and os.path.exists(invivo_slices):
+                slices = imread(invivo_slices)
                 self.loaded_layer_name = 'Loaded Image'
-                self.viewer.add_image(slices, name=self.loaded_layer_name, opacity=1)
-                print(f"Loaded ex vivo slices from {models['invivo_slices']}")
-                
-            # Load ex vivo segmentation if available
-            if os.path.exists(models['invivo_segmentation']):
-                mask_data = imread(models['invivo_segmentation'])
-                mask_layer = self.viewer.add_labels(mask_data, name='Mask', opacity=0.3)
-                print(f"Loaded ex vivo segmentation from {models['invivo_segmentation']}")
+                self.viewer.add_image(slices, name=self.loaded_layer_name, opacity=1,
+                                      scale=_get_scale(slices.ndim))
+                print(f"Loaded in vivo slices from {invivo_slices}")
+
+            invivo_seg = models.get('invivo_segmentation', '')
+            if invivo_seg and os.path.exists(invivo_seg):
+                mask_data = imread(invivo_seg)
+                self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
+                                       scale=_get_scale(mask_data.ndim))
+                print(f"Loaded in vivo segmentation from {invivo_seg}")
 
     def load_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Image File", filter="TIFF Files (*.tif *.tiff)")
         if file_path:
-            image_data = imread(file_path)  # Load the TIFF image
+            image_data = imread(file_path)
             self.loaded_layer_name = 'Loaded Image'
-            self.viewer.add_image(image_data, name=self.loaded_layer_name)
+            self.viewer.add_image(image_data, name=self.loaded_layer_name,
+                                  scale=_get_scale(image_data.ndim))
 
     def load_mask(self):
         mask_path, _ = QFileDialog.getOpenFileName(self, "Open Mask File", filter="TIFF Files (*.tif *.tiff)")
         if mask_path:
-            mask_data = imread(mask_path)  # Load the TIFF mask
-            mask_layer = self.viewer.add_labels(mask_data, name='Mask', opacity=0.3)
+            mask_data = imread(mask_path)
+            self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
+                                   scale=_get_scale(mask_data.ndim))
 
     def save_image(self):
         if self.loaded_layer_name is None:
@@ -278,43 +303,52 @@ class ImageLoader(QWidget):
         self.apply_transformation(np.flipud)
 
     def rotate_custom(self):
-        if not self.selected_slices:
-            print("No slices selected for transformation.")
+        if self.loaded_layer_name is None:
+            QMessageBox.warning(self, "Warning", "No image loaded.")
             return
-        
+
         try:
             layer = self.viewer.layers[self.loaded_layer_name]
         except KeyError:
-            print(f"Layer '{self.loaded_layer_name}' not found.")
+            QMessageBox.warning(self, "Warning", f"Layer '{self.loaded_layer_name}' not found.")
             return
 
-        # Prompt the user for the custom angle
-        angle, ok = QInputDialog.getDouble(self, "Rotate Slices", "Enter rotation angle (degrees):", 0, -360, 360, 1)
+        angle, ok = QInputDialog.getDouble(self, "Rotate by Custom Angle", "Enter rotation angle (degrees):", 0, -360, 360, 1)
         if not ok:
             return
 
-        for slice_idx in self.selected_slices:
-            layer.data[slice_idx] = rotate(layer.data[slice_idx], angle, reshape=False, mode='nearest')
+        data = layer.data
+        if data.ndim == 2:
+            layer.data = rotate(data, angle, reshape=False, mode='nearest')
+        else:
+            slices = self.selected_slices if self.selected_slices else range(data.shape[0])
+            for idx in slices:
+                layer.data[idx] = rotate(layer.data[idx], angle, reshape=False, mode='nearest')
 
-        layer.refresh()  # Update the viewer
-        print(f"Rotated slices: {self.selected_slices} by {angle}°")
+        layer.refresh()
+        print(f"Rotated by {angle}°")
 
     def apply_transformation(self, transform):
-        if not self.selected_slices:
-            print("No slices selected for transformation.")
+        if self.loaded_layer_name is None:
+            QMessageBox.warning(self, "Warning", "No image loaded.")
             return
 
         try:
             layer = self.viewer.layers[self.loaded_layer_name]
         except KeyError:
-            print(f"Layer '{self.loaded_layer_name}' not found.")
+            QMessageBox.warning(self, "Warning", f"Layer '{self.loaded_layer_name}' not found.")
             return
 
-        for slice_idx in self.selected_slices:
-            layer.data[slice_idx] = transform(layer.data[slice_idx])
+        data = layer.data
+        if data.ndim == 2:
+            layer.data = transform(data)
+        else:
+            slices = self.selected_slices if self.selected_slices else range(data.shape[0])
+            for idx in slices:
+                layer.data[idx] = transform(layer.data[idx])
 
-        layer.refresh()  # Update the viewer
-        print(f"Transformed slices: {self.selected_slices}")
+        layer.refresh()
+        print(f"Transformation applied to {'selected slices' if self.selected_slices else 'all slices'}")
 
     def segment_2d(self):
         if self.loaded_layer_name is None:
@@ -362,7 +396,7 @@ class ImageLoader(QWidget):
         self.worker.start()
 
     def display_segmentation_result(self, result):
-        self.viewer.add_labels(result, name="Segmentation Result")
+        self.viewer.add_labels(result, name="Segmentation Result", scale=_get_scale(result.ndim))
         QMessageBox.information(self, "Segmentation Complete", "Segmentation completed and added to viewer.")
 
 
@@ -416,7 +450,7 @@ class MatchHandler:
         # Highlight the label temporarily
         temp_data = np.zeros_like(mask_layer.data)
         temp_data[mask_layer.data == label] = 1
-        viewer.add_labels(temp_data, name="Selected", opacity=0.7)
+        viewer.add_labels(temp_data, name="Selected", opacity=0.7, scale=_get_scale(temp_data.ndim))
         #QMessageBox.information(viewer.window._qt_window, "Label Selected", 
         #                       f"Selected label {label}. Press 'm' in the other viewer to complete #match.")
         
@@ -466,13 +500,13 @@ class MatchHandler:
 
         # Update CSV file
         if os.path.exists(self.glomeruli_path):
-            df = pd.read_csv(self.glomeruli_path)
+            df = pd.read_csv(self.glomeruli_path, encoding='utf-8')
         else:
             df = pd.DataFrame(columns=['invivo', 'exvivo', 'color'])
             
         # Add new match to dataframe
         df.loc[len(df)] = [v1, v2, color]
-        df.to_csv(self.glomeruli_path, index=False)
+        df.to_csv(self.glomeruli_path, index=False, encoding='utf-8')
 
         # Save match to undo stack
         self.undo_stack.append((v1, v2, color))
@@ -512,10 +546,10 @@ class MatchHandler:
 
         # Update CSV file
         if os.path.exists(self.glomeruli_path):
-            df = pd.read_csv(self.glomeruli_path)
+            df = pd.read_csv(self.glomeruli_path, encoding='utf-8')
             # Remove the match
             df = df[~((df['invivo'] == v1) & (df['exvivo'] == v2) & (df['color'] == color))]
-            df.to_csv(self.glomeruli_path, index=False)
+            df.to_csv(self.glomeruli_path, index=False, encoding='utf-8')
             
         # Save updated match images
         invivo_matches_path = os.path.join(MATCHES_DIR, 'invivo_matches.tif')
@@ -572,11 +606,11 @@ class MatchLoader:
                 exvivo_df = self._get_region_table(exvivo_seg)
                 
                 # Save to CSV
-                invivo_df.to_csv(invivo_glomeruli_path, index=False)
-                exvivo_df.to_csv(exvivo_glomeruli_path, index=False)
+                invivo_df.to_csv(invivo_glomeruli_path, index=False, encoding='utf-8')
+                exvivo_df.to_csv(exvivo_glomeruli_path, index=False, encoding='utf-8')
                 
                 # Create empty matches CSV
-                pd.DataFrame(columns=['invivo', 'exvivo', 'color']).to_csv(base_path, index=False)
+                pd.DataFrame(columns=['invivo', 'exvivo', 'color']).to_csv(base_path, index=False, encoding='utf-8')
                 
                 # Create empty match layers
                 invivo_data = np.zeros_like(invivo_seg)
@@ -598,13 +632,15 @@ class MatchLoader:
             self.in_vivo_viewer.layers['matches'].data = invivo_data
             self.in_vivo_viewer.layers['matches'].refresh()
         else:
-            self.in_vivo_viewer.add_labels(invivo_data, name='matches', opacity=1.0)
-            
+            self.in_vivo_viewer.add_labels(invivo_data, name='matches', opacity=1.0,
+                                           scale=_get_scale(invivo_data.ndim))
+
         if 'matches' in self.ex_vivo_viewer.layers:
             self.ex_vivo_viewer.layers['matches'].data = exvivo_data
             self.ex_vivo_viewer.layers['matches'].refresh()
         else:
-            self.ex_vivo_viewer.add_labels(exvivo_data, name='matches', opacity=1.0)
+            self.ex_vivo_viewer.add_labels(exvivo_data, name='matches', opacity=1.0,
+                                           scale=_get_scale(exvivo_data.ndim))
 
     def _get_region_table(self, seg):
         """Extract region properties from segmentation"""
@@ -631,9 +667,8 @@ class MatchLoader:
 def main():
     """Main function to start the GlomerAlign application"""
     # Load configuration
-    config_path = "./config/config.yaml"
-    load_global_config(config_path)
-    
+    load_global_config()
+
     # Create the viewers
     in_vivo_viewer = napari.Viewer(title='In Vivo Brain Viewer')
     ex_vivo_viewer = napari.Viewer(title='Ex Vivo Slices Viewer')

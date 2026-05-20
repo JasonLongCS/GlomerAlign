@@ -1,10 +1,10 @@
-# Core dependencies
-napari                     
-PyYAML                     
-
-# Scientific computing
-numpy                      
-scipy                    
-
-scikit-image               
-opencv-python              
+napari
+PyQt5
+PyYAML
+numpy
+scipy
+scikit-image
+opencv-python
+pandas
+tifffile
+cellpose

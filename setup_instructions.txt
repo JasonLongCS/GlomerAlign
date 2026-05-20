@@ -1,0 +1,45 @@
+GlomerAlign - Setup Instructions
+==================================
+
+1. Create and activate the conda environment
+---------------------------------------------
+    conda create -n glomeralign python=3.10 -y
+    conda activate glomeralign
+
+2. Install the package in dev mode (run once from the repo root)
+-----------------------------------------------------------------
+    pip install -e .
+
+3. Launch the app
+-----------------
+    glomeralign
+
+    Or alternatively:
+    python -m glomeralign.gui
+
+4. Configure segmentation models (optional)
+--------------------------------------------
+To use the 2D and 3D segmentation buttons, edit the config file:
+
+    glomeralign/config/config.yaml
+
+Set the "2d" and "3d" keys to the absolute paths of your local
+Cellpose model files. For example:
+
+    models:
+      2d: "C:/path/to/your/cellpose_model_2d"
+      3d: "C:/path/to/your/cellpose_model_3d"
+
+The app launches fine without these — the segmentation buttons will
+just show a warning if no model path is set.
+
+Notes
+-----
+- The app opens two napari windows: "In Vivo Brain Viewer" and
+  "Ex Vivo Slices Viewer". Each has a control panel on the right.
+- Load your TIFF images using the "Load Image" button in each viewer.
+- Load segmentation masks using the "Load Mask" button.
+- Use "Load Matched Data" only after masks are loaded in both viewers.
+- Press "h" on the keyboard (with a Mask layer active) to select a
+  glomerulus for matching. Select one in each viewer to record a match.
+- Press "z" to undo the last match.

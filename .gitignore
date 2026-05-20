@@ -1,1 +1,14 @@
+# macOS
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# pip editable install
+*.egg-link
+
+# Runtime output — generated when the app runs
+matches/

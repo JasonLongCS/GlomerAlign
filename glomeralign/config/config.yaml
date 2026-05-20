@@ -1,3 +1,15 @@
 models:
-  2d: "/Users/soitu/Desktop/cellpose_models/2d/CP_20240823_095004"
-  3d: "/Users/soitu/Desktop/cellpose_models/3d/CP_20250114_20thslice"
+  # Cellpose model paths — fill in with absolute paths to your model files
+  2d: ""
+  3d: ""
+  # Optional: pre-load image files on startup (leave empty to load manually via GUI)
+  invivo_slices: ""
+  invivo_segmentation: ""
+  exvivo_slices: ""
+  exvivo_segmentation: ""
+
+# Voxel size in micrometers — used to correct the aspect ratio in 3D view.
+# xy: lateral pixel size, z: depth per slice.
+scale:
+  xy: 2.9
+  z: 20.0

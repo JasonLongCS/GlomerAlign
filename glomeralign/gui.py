@@ -425,18 +425,28 @@ class MatchHandler:
         if active_layer is None or active_layer.name != 'Mask':
             print("Please select a label from the Mask layer")
             return
-            
+        #print(active_layer.data.shape)
+        
         # Get the label at the current cursor position
-        cursor_pos = tuple(map(int, np.round(viewer.cursor.position)))
+        pos = viewer.cursor.position
+        # divide the cursor position by scale to get actual matching mask labelss
+        z_scale, x_scale, y_scale = _get_scale(3)
+        cursor_pos = (
+            pos[0] / z_scale,
+            pos[1] / x_scale,
+            pos[2] / y_scale,
+        )
+        actual_cursor_pos = tuple(map(int, np.round(cursor_pos)))
+        print(actual_cursor_pos)
         try:
-            selected_label = active_layer.data[cursor_pos]
+            selected_label = active_layer.data[actual_cursor_pos]
             if selected_label == 0:  # Background
                 print("Background selected (label 0), please select a valid label")
                 return
                 
             self.on_label_selected(viewer_name, selected_label)
         except IndexError:
-            print("Cursor position outside image bounds")
+            print(f"Cursor position outside image bounds in {viewer_name}")
             
     def on_label_selected(self, viewer_name, label):
         """Store the selected label and its viewer"""

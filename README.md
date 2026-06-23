@@ -18,7 +18,6 @@ GlomerAlign is a Python application for aligning and comparing in vivo and ex vi
   - scikit-image
   - napari
   - PyQt5
-  - cellpose
 
 ### Setup
 
@@ -30,7 +29,7 @@ GlomerAlign is a Python application for aligning and comparing in vivo and ex vi
 
 2. Install the required packages:
    ```bash
-   pip install numpy pandas pyyaml tifffile scipy scikit-image napari pyqt5 cellpose
+   pip install numpy pandas pyyaml tifffile scipy scikit-image napari pyqt5 
    ```
 
 3. Create a configuration file:
@@ -40,8 +39,6 @@ GlomerAlign is a Python application for aligning and comparing in vivo and ex vi
    Create a file named `config.yaml` in the `config` directory with the following structure:
    ```yaml
    models:
-     2d: "path/to/2d/model"
-     3d: "path/to/3d/model"
      invivo_slices: "path/to/invivo/slices.tif"
      invivo_segmentation: "path/to/invivo/segmentation.tif"
      exvivo_slices: "path/to/exvivo/slices.tif"
@@ -70,17 +67,8 @@ This will open two Napari viewers: one for in vivo brain images and one for ex v
 
 - Select specific slices for processing
 - Apply transformations to selected slices:
-  - 90° rotation
-  - 180° rotation
-  - Custom angle rotation
-  - Horizontal flip
-  - Vertical flip
-
-### Segmentation
-
-- 2D segmentation using Cellpose
-- 3D segmentation using Cellpose
-- GPU acceleration support
+  - Rotation
+  - Translation
 
 ### Glomeruli Matching
 
@@ -101,13 +89,8 @@ Both the in vivo and ex vivo viewers have an Image Loader panel with the followi
 - **Load Matched Data**: Load previously saved matching data
 - **Save Image**: Save the currently displayed image to a TIFF file
 - **Select Slices**: Open a dialog to select specific slices for processing
-- **Segmentation 2D**: Run 2D segmentation on the loaded image
-- **Segmentation 3D**: Run 3D segmentation on the loaded image
-- **Rotate 180°**: Rotate selected slices by 180 degrees
-- **Rotate 90°**: Rotate selected slices by 90 degrees
-- **Flip Horizontally**: Flip selected slices horizontally
-- **Flip Vertically**: Flip selected slices vertically
-- **Rotate by Custom Angle**: Rotate selected slices by a user-specified angle
+- **Translation**: Move sliders to translate image across their respective axes
+- **Rotation**: Move sliders to rotate image around their respective axes
 
 ### Keyboard Shortcuts
 
@@ -129,10 +112,9 @@ Both the in vivo and ex vivo viewers have an Image Loader panel with the followi
 ### Main Components
 
 1. **ImageLoader**: Handles loading, saving, and manipulating images in each viewer
-2. **SegmentationWorker**: Runs Cellpose segmentation in a separate thread
-3. **SliceSelectorDialog**: Provides a UI for selecting specific slices
-4. **MatchHandler**: Manages the matching of structures between viewers
-5. **MatchLoader**: Handles loading and saving match data
+2. **SliceSelectorDialog**: Provides a UI for selecting specific slices
+3. **MatchHandler**: Manages the matching of structures between viewers
+4. **MatchLoader**: Handles loading and saving match data
 
 ### Data Structure
 
@@ -148,7 +130,6 @@ The application creates a `matches` directory with the following files:
 
 The application uses a YAML configuration file to store paths to:
 
-- 2D and 3D segmentation models
 - Default in vivo and ex vivo images
 - Default in vivo and ex vivo segmentation masks
 
@@ -157,7 +138,6 @@ The application uses a YAML configuration file to store paths to:
 ### Common Issues
 
 1. **Missing configuration file**: Ensure the `config.yaml` file is located in the `./config/` directory
-2. **Segmentation errors**: Verify that Cellpose models are correctly specified in the configuration
 3. **Match data loading errors**: Check that both viewers have mask layers loaded
 
 ### Error Messages
@@ -178,7 +158,6 @@ The application uses a YAML configuration file to store paths to:
 
 - **Napari**: Main visualization framework
 - **PyQt**: UI components and threading
-- **Cellpose**: Neural network-based segmentation
 - **NumPy/SciPy**: Image processing and analysis
 - **Pandas**: Data management and CSV handling
 

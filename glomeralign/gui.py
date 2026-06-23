@@ -117,7 +117,7 @@ def rotation_matrix_3d(rx_deg, ry_deg, rz_deg):
     return Rz @ Ry @ Rx
 
 
-def make_affine_3d(rx, ry, rz, center_zyx):
+def make_affine_3d(rx, ry, rz, tz, ty, tx, center_zyx):
     cz, cy, cx = center_zyx
 
     T1 = np.eye(4)
@@ -126,9 +126,12 @@ def make_affine_3d(rx, ry, rz, center_zyx):
     T2 = np.eye(4)
     T2[:3, 3] = [cz, cy, cx]
 
+    T3 = np.eye(4)
+    T3[:3, 3] = [tz, ty, tx]
+
     R = rotation_matrix_3d(rx, ry, rz)
 
-    return T2 @ R @ T1
+    return T3 @ T2 @ R @ T1
 
 
 
@@ -226,23 +229,40 @@ class ImageLoader(QWidget):
         # Affine rotation sliders
         layout.addWidget(QLabel("Affine Rotation"))
 
+        # add selection of current layer to this loop
+        # text here
+
+        # creating sliders for translation and rotation
+        self.tx_slider = self.make_slider(-1000, 1000, 0)
+        self.ty_slider = self.make_slider(-1000, 1000, 0)
+        self.tz_slider = self.make_slider(-1000, 1000, 0)
+
         self.rx_slider = self.make_slider(-180, 180, 0)
         self.ry_slider = self.make_slider(-180, 180, 0)
         self.rz_slider = self.make_slider(-180, 180, 0)
 
+        layout.addWidget(QLabel("Translate X"))
+        layout.addWidget(self.tx_slider)
+        layout.addWidget(QLabel("Translate Y"))
+        layout.addWidget(self.ty_slider)
+        layout.addWidget(QLabel("Translate Z"))
+        layout.addWidget(self.tz_slider)
+
         layout.addWidget(QLabel("Rotate X"))
         layout.addWidget(self.rx_slider)
-
         layout.addWidget(QLabel("Rotate Y"))
         layout.addWidget(self.ry_slider)
-
         layout.addWidget(QLabel("Rotate Z"))
         layout.addWidget(self.rz_slider)
 
-        self.rx_slider.valueChanged.connect(self.update_affine_rotation)
-        self.ry_slider.valueChanged.connect(self.update_affine_rotation)
-        self.rz_slider.valueChanged.connect(self.update_affine_rotation)
+        self.tx_slider.valueChanged.connect(self.update_affine_transformation)
+        self.ty_slider.valueChanged.connect(self.update_affine_transformation)
+        self.tz_slider.valueChanged.connect(self.update_affine_transformation)
+        self.rx_slider.valueChanged.connect(self.update_affine_transformation)
+        self.ry_slider.valueChanged.connect(self.update_affine_transformation)
+        self.rz_slider.valueChanged.connect(self.update_affine_transformation)
 
+        # applies previously saved affine transformation from import
         self.apply_affine_button = QPushButton("Apply Saved Affine")
         self.apply_affine_button.clicked.connect(self.apply_saved_affine)
         layout.addWidget(self.apply_affine_button)
@@ -354,7 +374,7 @@ class ImageLoader(QWidget):
         return slider
 
     # refresh based on rotation/ will rewrite based on translation
-    def update_affine_rotation(self):
+    def update_affine_transformation(self):
         if self.loaded_layer_name is None:
             return
 
@@ -362,13 +382,18 @@ class ImageLoader(QWidget):
             layer = self.viewer.layers[self.loaded_layer_name]
         except KeyError:
             return
+        
+        tx = self.tx_slider.value()
+        ty = self.ty_slider.value()
+        tz = self.tz_slider.value()
 
         rx = self.rx_slider.value()
         ry = self.ry_slider.value()
         rz = self.rz_slider.value()
 
         center = (np.array(layer.data.shape) - 1) / 2
-        layer.affine = make_affine_3d(rx, ry, rz, center)
+        #change this
+        layer.affine = make_affine_3d(rx, ry, rz, tz, ty, tx, center)
         layer.refresh()
 
 class MatchHandler:

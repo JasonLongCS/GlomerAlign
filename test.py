@@ -149,6 +149,11 @@ def load_images(
         scale=(transform_widget.z_thickness.value, 1, 1),
         rendering="mip",
     )
+    print("fixed", current_fixed.shape)
+    print("moving", current_moving.shape)
+
+    print("fixed extent", fixed_layer.extent.world)
+    print("moving extent", moving_layer.extent.world)
 
     update_transform()
 

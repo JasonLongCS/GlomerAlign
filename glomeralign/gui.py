@@ -11,16 +11,16 @@ if hasattr(sys.stderr, 'reconfigure'):
 import numpy as np
 import pandas as pd
 import yaml
+import json
 from tifffile import imread, imwrite
 from scipy.ndimage import rotate
 from skimage.measure import regionprops_table
 import napari
 from PyQt5.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget, QFileDialog, QInputDialog, QDialog,
-    QScrollArea, QCheckBox, QDialogButtonBox, QHBoxLayout, QMessageBox
+    QScrollArea, QCheckBox, QDialogButtonBox, QHBoxLayout, QMessageBox, QLabel, QSlider
 )
-from PyQt5.QtCore import QThread, pyqtSignal
-from cellpose import models
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
 # Create matches directory
 MATCHES_DIR = "matches"
@@ -28,6 +28,7 @@ os.makedirs(MATCHES_DIR, exist_ok=True)
 
 # Global config variable
 CONFIG = {}
+TRANSFORM_CONFIG = {}
 
 def _get_scale(ndim):
     """Return a scale tuple (z, y, x) or (y, x) from config, defaulting to 1.0."""
@@ -53,26 +54,83 @@ def load_global_config(config_path=None):
         print(f"Config file not found: {config_path}")
         CONFIG = {"models": {}}
         return False
+    
 
-# Thread for segmentation
-class SegmentationWorker(QThread):
-    finished = pyqtSignal(np.ndarray)
+    # WIP
+def load_transform_config(config_path=None):
+    
+    global TRANSFORM_CONFIG
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(__file__), "alignment_transform.json")
+    try:
+        with open(config_path, 'r', encoding='utf-8') as file:
+            TRANSFORM_CONFIG = json.load(file)
+        print(f"Config loaded from {config_path}")
+        print(f"Config data: {TRANSFORM_CONFIG}")
+        return True
+    except FileNotFoundError:
+        print(f"Config file not found: {config_path}")
+        CONFIG = {"models": {}}
+        return False
 
-    def __init__(self, data, model_path, is_3d=False):
-        super().__init__()
-        self.data = data
-        self.model_path = model_path
-        self.is_3d = is_3d
+def apply_saved_transform(layer):
+    global TRANSFORM_CONFIG
 
-    def run(self):
-        model = models.CellposeModel(gpu=True, pretrained_model=self.model_path)
-        if self.is_3d:
-            segmented = model.eval(self.data, channels=[0, 0], do_3D=True)[0]
-        else:
-            segmented = np.array([model.eval(slice_data, channels=[2, 0], 
-                                  flow_threshold=0, cellprob_threshold=0)[0] 
-                                  for slice_data in self.data])
-        self.finished.emit(segmented)
+    if not TRANSFORM_CONFIG:
+        print("No transform config loaded.")
+        return
+
+    #if "scale" in TRANSFORM_CONFIG:
+        #layer.scale = tuple(TRANSFORM_CONFIG["scale"])
+
+    if "affine_matrix" in TRANSFORM_CONFIG:
+        layer.affine = np.asarray(TRANSFORM_CONFIG["affine_matrix"])
+
+    layer.refresh()
+    print("Applied saved affine transform.")
+
+
+def rotation_matrix_3d(rx_deg, ry_deg, rz_deg):
+    rx, ry, rz = np.deg2rad([rx_deg, ry_deg, rz_deg])
+
+    Rx = np.array([
+        [1, 0, 0, 0],
+        [0, np.cos(rx), -np.sin(rx), 0],
+        [0, np.sin(rx),  np.cos(rx), 0],
+        [0, 0, 0, 1],
+    ])
+
+    Ry = np.array([
+        [np.cos(ry), 0, np.sin(ry), 0],
+        [0, 1, 0, 0],
+        [-np.sin(ry), 0, np.cos(ry), 0],
+        [0, 0, 0, 1],
+    ])
+
+    Rz = np.array([
+        [np.cos(rz), -np.sin(rz), 0, 0],
+        [np.sin(rz),  np.cos(rz), 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
+    ])
+
+    return Rz @ Ry @ Rx
+
+
+def make_affine_3d(rx, ry, rz, center_zyx):
+    cz, cy, cx = center_zyx
+
+    T1 = np.eye(4)
+    T1[:3, 3] = [-cz, -cy, -cx]
+
+    T2 = np.eye(4)
+    T2[:3, 3] = [cz, cy, cx]
+
+    R = rotation_matrix_3d(rx, ry, rz)
+
+    return T2 @ R @ T1
+
+
 
 # Dialog for selecting slices
 class SliceSelectorDialog(QDialog):
@@ -138,6 +196,7 @@ class ImageLoader(QWidget):
         self.viewer_type = viewer_type  # Either 'invivo' or 'exvivo'
         self.loaded_layer_name = None  # Track the loaded image layer name
         self.selected_slices = set()
+
         
         # Layout
         layout = QVBoxLayout()
@@ -164,41 +223,49 @@ class ImageLoader(QWidget):
         self.select_slices_button.clicked.connect(self.select_slices)
         layout.addWidget(self.select_slices_button)
 
-        # Segmentation buttons
-        self.segment_2d_button = QPushButton("Segmentation 2D")
-        self.segment_2d_button.clicked.connect(self.segment_2d)
-        layout.addWidget(self.segment_2d_button)
+        # Affine rotation sliders
+        layout.addWidget(QLabel("Affine Rotation"))
 
-        self.segment_3d_button = QPushButton("Segmentation 3D")
-        self.segment_3d_button.clicked.connect(self.segment_3d)
-        layout.addWidget(self.segment_3d_button)
+        self.rx_slider = self.make_slider(-180, 180, 0)
+        self.ry_slider = self.make_slider(-180, 180, 0)
+        self.rz_slider = self.make_slider(-180, 180, 0)
 
-        # Transform buttons
-        self.rotate_180_button = QPushButton("Rotate 180°")
-        self.rotate_180_button.clicked.connect(self.rotate_180)
-        layout.addWidget(self.rotate_180_button)
+        layout.addWidget(QLabel("Rotate X"))
+        layout.addWidget(self.rx_slider)
 
-        self.rotate_90_button = QPushButton("Rotate 90°")
-        self.rotate_90_button.clicked.connect(self.rotate_90)
-        layout.addWidget(self.rotate_90_button)
+        layout.addWidget(QLabel("Rotate Y"))
+        layout.addWidget(self.ry_slider)
 
-        self.flip_horizontal_button = QPushButton("Flip Horizontally")
-        self.flip_horizontal_button.clicked.connect(self.flip_horizontal)
-        layout.addWidget(self.flip_horizontal_button)
+        layout.addWidget(QLabel("Rotate Z"))
+        layout.addWidget(self.rz_slider)
 
-        self.flip_vertical_button = QPushButton("Flip Vertically")
-        self.flip_vertical_button.clicked.connect(self.flip_vertical)
-        layout.addWidget(self.flip_vertical_button)
+        self.rx_slider.valueChanged.connect(self.update_affine_rotation)
+        self.ry_slider.valueChanged.connect(self.update_affine_rotation)
+        self.rz_slider.valueChanged.connect(self.update_affine_rotation)
 
-        self.custom_rotate_button = QPushButton("Rotate by Custom Angle")
-        self.custom_rotate_button.clicked.connect(self.rotate_custom)
-        layout.addWidget(self.custom_rotate_button)
+        self.apply_affine_button = QPushButton("Apply Saved Affine")
+        self.apply_affine_button.clicked.connect(self.apply_saved_affine)
+        layout.addWidget(self.apply_affine_button)
 
         self.setLayout(layout)
         
         # Load config data appropriate for this viewer type
         self.load_config_data()
         
+    # applies saved affine transformation through the click of a button.
+    def apply_saved_affine(self):
+        if self.loaded_layer_name is None:
+            QMessageBox.warning(self, "Warning", "No image loaded.")
+            return
+
+        try:
+            layer = self.viewer.layers[self.loaded_layer_name]
+        except KeyError:
+            QMessageBox.warning(self, "Warning", f"Layer '{self.loaded_layer_name}' not found.")
+            return
+
+        apply_saved_transform(layer)
+
     def load_config_data(self):
         """Load data from config specific to this viewer type (invivo/exvivo)"""
         global CONFIG
@@ -219,13 +286,6 @@ class ImageLoader(QWidget):
                                       scale=_get_scale(image_data.ndim))
                 print(f"Loaded ex vivo stack from {exvivo_slices}")
 
-            exvivo_seg = models.get('exvivo_segmentation', '')
-            if exvivo_seg and os.path.exists(exvivo_seg):
-                mask_data = imread(exvivo_seg)
-                self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
-                                       scale=_get_scale(mask_data.ndim))
-                print(f"Loaded ex vivo segmentation from {exvivo_seg}")
-
         elif self.viewer_type == 'invivo':
             invivo_slices = models.get('invivo_slices', '')
             if invivo_slices and os.path.exists(invivo_slices):
@@ -235,27 +295,20 @@ class ImageLoader(QWidget):
                                       scale=_get_scale(slices.ndim))
                 print(f"Loaded in vivo slices from {invivo_slices}")
 
-            invivo_seg = models.get('invivo_segmentation', '')
-            if invivo_seg and os.path.exists(invivo_seg):
-                mask_data = imread(invivo_seg)
-                self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
-                                       scale=_get_scale(mask_data.ndim))
-                print(f"Loaded in vivo segmentation from {invivo_seg}")
-
     def load_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Image File", filter="TIFF Files (*.tif *.tiff)")
         if file_path:
             image_data = imread(file_path)
             self.loaded_layer_name = 'Loaded Image'
             self.viewer.add_image(image_data, name=self.loaded_layer_name,
-                                  scale=_get_scale(image_data.ndim))
+                                  scale=_get_scale(3))
 
     def load_mask(self):
         mask_path, _ = QFileDialog.getOpenFileName(self, "Open Mask File", filter="TIFF Files (*.tif *.tiff)")
         if mask_path:
             mask_data = imread(mask_path)
             self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
-                                   scale=_get_scale(mask_data.ndim))
+                                   scale=_get_scale(3))
 
     def save_image(self):
         if self.loaded_layer_name is None:
@@ -290,115 +343,33 @@ class ImageLoader(QWidget):
             self.selected_slices = dialog.selected_slices
             print(f"Selected slices: {self.selected_slices}")
 
-    def rotate_180(self):
-        self.apply_transformation(lambda data: np.rot90(data, 2))
+    # helper method to make a slider for rotation and translation (sliding later)
+    def make_slider(self, min_val, max_val, default):
+        slider = QSlider(Qt.Horizontal)
+        slider.setMinimum(min_val)
+        slider.setMaximum(max_val)
+        slider.setValue(default)
+        slider.setTickInterval(15)
+        slider.setTickPosition(QSlider.TicksBelow)
+        return slider
 
-    def rotate_90(self):
-        self.apply_transformation(lambda data: np.rot90(data, 1))
-
-    def flip_horizontal(self):
-        self.apply_transformation(np.fliplr)
-
-    def flip_vertical(self):
-        self.apply_transformation(np.flipud)
-
-    def rotate_custom(self):
+    # refresh based on rotation/ will rewrite based on translation
+    def update_affine_rotation(self):
         if self.loaded_layer_name is None:
-            QMessageBox.warning(self, "Warning", "No image loaded.")
             return
 
         try:
             layer = self.viewer.layers[self.loaded_layer_name]
         except KeyError:
-            QMessageBox.warning(self, "Warning", f"Layer '{self.loaded_layer_name}' not found.")
             return
 
-        angle, ok = QInputDialog.getDouble(self, "Rotate by Custom Angle", "Enter rotation angle (degrees):", 0, -360, 360, 1)
-        if not ok:
-            return
+        rx = self.rx_slider.value()
+        ry = self.ry_slider.value()
+        rz = self.rz_slider.value()
 
-        data = layer.data
-        if data.ndim == 2:
-            layer.data = rotate(data, angle, reshape=False, mode='nearest')
-        else:
-            slices = self.selected_slices if self.selected_slices else range(data.shape[0])
-            for idx in slices:
-                layer.data[idx] = rotate(layer.data[idx], angle, reshape=False, mode='nearest')
-
+        center = (np.array(layer.data.shape) - 1) / 2
+        layer.affine = make_affine_3d(rx, ry, rz, center)
         layer.refresh()
-        print(f"Rotated by {angle}°")
-
-    def apply_transformation(self, transform):
-        if self.loaded_layer_name is None:
-            QMessageBox.warning(self, "Warning", "No image loaded.")
-            return
-
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-        except KeyError:
-            QMessageBox.warning(self, "Warning", f"Layer '{self.loaded_layer_name}' not found.")
-            return
-
-        data = layer.data
-        if data.ndim == 2:
-            layer.data = transform(data)
-        else:
-            slices = self.selected_slices if self.selected_slices else range(data.shape[0])
-            for idx in slices:
-                layer.data[idx] = transform(layer.data[idx])
-
-        layer.refresh()
-        print(f"Transformation applied to {'selected slices' if self.selected_slices else 'all slices'}")
-
-    def segment_2d(self):
-        if self.loaded_layer_name is None:
-            QMessageBox.warning(self, "Warning", "No image loaded for segmentation.")
-            return
-        
-        global CONFIG
-        models = CONFIG.get('models', {})
-        
-        if not models.get('2d'):
-            QMessageBox.warning(self, "Warning", "2D model path not specified in config.")
-            return
-
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-        except KeyError:
-            QMessageBox.critical(self, "Error", "Layer not found.")
-            return
-
-        self.run_segmentation(layer.data, models['2d'], is_3d=False)
-
-    def segment_3d(self):
-        if self.loaded_layer_name is None:
-            QMessageBox.warning(self, "Warning", "No image loaded for segmentation.")
-            return
-
-        global CONFIG
-        models = CONFIG.get('models', {})
-        
-        if not models.get('3d'):
-            QMessageBox.warning(self, "Warning", "3D model path not specified in config.")
-            return
-
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-        except KeyError:
-            QMessageBox.critical(self, "Error", "Layer not found.")
-            return
-
-        self.run_segmentation(layer.data, models['3d'], is_3d=True)
-
-    def run_segmentation(self, data, model_path, is_3d):
-        self.worker = SegmentationWorker(data, model_path, is_3d)
-        self.worker.finished.connect(self.display_segmentation_result)
-        self.worker.start()
-
-    def display_segmentation_result(self, result):
-        self.viewer.add_labels(result, name="Segmentation Result", scale=_get_scale(result.ndim))
-        QMessageBox.information(self, "Segmentation Complete", "Segmentation completed and added to viewer.")
-
 
 class MatchHandler:
     def __init__(self, in_vivo_viewer, ex_vivo_viewer):
@@ -678,6 +649,7 @@ def main():
     """Main function to start the GlomerAlign application"""
     # Load configuration
     load_global_config()
+    load_transform_config()
 
     # Create the viewers
     in_vivo_viewer = napari.Viewer(title='In Vivo Brain Viewer')

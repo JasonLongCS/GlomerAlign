@@ -380,6 +380,8 @@ class ImageLoader(QWidget):
 
         try:
             layer = self.viewer.layers[self.loaded_layer_name]
+            if self.viewer.layers["Mask"]:
+                mask = self.viewer.layers["Mask"]
         except KeyError:
             return
         
@@ -395,6 +397,9 @@ class ImageLoader(QWidget):
         #change this
         layer.affine = make_affine_3d(rx, ry, rz, tz, ty, tx, center)
         layer.refresh()
+        if mask:
+            mask.affine = make_affine_3d(rx, ry, rz, tz, ty, tx, center)
+            mask.refresh()
 
 class MatchHandler:
     def __init__(self, in_vivo_viewer, ex_vivo_viewer):

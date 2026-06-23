@@ -23,16 +23,10 @@ GlomerAlign is a Python application for aligning and comparing in vivo and ex vi
 
 1. Clone the repository:
    ```bash
-   git clone git@github.com:CristiSoitu/GlomerAlign.git
-   cd glomeralign
+   git clone git@github.com:JasonLongCS/GlomerAlign.git
    ```
 
-2. Install the required packages:
-   ```bash
-   pip install numpy pandas pyyaml tifffile scipy scikit-image napari pyqt5 
-   ```
-
-3. Create a configuration file:
+2. Create a configuration file:
    ```
    mkdir config
    ```
@@ -45,6 +39,8 @@ GlomerAlign is a Python application for aligning and comparing in vivo and ex vi
      exvivo_segmentation: "path/to/exvivo/segmentation.tif"
    ```
 
+3. Follow instructions in setup_instructions.txt...
+
 ## Running the Application
 
 To start GlomerAlign, simply run:
@@ -54,6 +50,7 @@ python gui.py
 ```
 
 This will open two Napari viewers: one for in vivo brain images and one for ex vivo slices.
+WIP: three viewers, one additional viewer for aligning orientation in both in vivo (2P) and ex vivo (in vitro) volumes to assist in glomeruli matching. 
 
 ## Features
 

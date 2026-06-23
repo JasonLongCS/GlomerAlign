@@ -315,14 +315,15 @@ class ImageLoader(QWidget):
                                       scale=_get_scale(slices.ndim))
                 print(f"Loaded in vivo slices from {invivo_slices}")
 
-    def load_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image File", filter="TIFF Files (*.tif *.tiff)")
-        if file_path:
-            image_data = imread(file_path)
-            self.loaded_layer_name = 'Loaded Image'
-            self.viewer.add_image(image_data, name=self.loaded_layer_name,
-                                  scale=_get_scale(3))
-
+        elif self.viewer_type == 'compare':
+            compare_slices = models.get('compare_slices', '')
+            if compare_slices and os.path.exists(compare_slices):
+                slices = imread(compare_slices)
+                self.loaded_layer_name = 'Loaded Image'
+                self.viewer.add_image(slices, name=self.loaded_layer_name, opacity=1,
+                                      scale=_get_scale(slices.ndim))
+                print(f"Loaded in vivo slices from {invivo_slices}")
+                
     def load_mask(self):
         mask_path, _ = QFileDialog.getOpenFileName(self, "Open Mask File", filter="TIFF Files (*.tif *.tiff)")
         if mask_path:
@@ -593,7 +594,7 @@ class MatchLoader:
 
         # Paths for match files
         invivo_matches_path = os.path.join(MATCHES_DIR, 'invivo_matches.tif')
-        exvivo_matches_path = os.path.join(MATCHES_DIR, 'exvivo_matches.tif')
+        exvivo_matches_path = os.path.join(MATCHES_DIR, 'exvivo_maches.tif')
         invivo_glomeruli_path = os.path.join(MATCHES_DIR, 'invivo_glomeruli.csv')
         exvivo_glomeruli_path = os.path.join(MATCHES_DIR, 'exvivo_glomeruli.csv')
 
@@ -682,14 +683,17 @@ def main():
     load_transform_config()
 
     # Create the viewers
+    #comparison_viewer = napari.Viewer(title='Comparison Viewer')
     in_vivo_viewer = napari.Viewer(title='In Vivo Brain Viewer')
     ex_vivo_viewer = napari.Viewer(title='Ex Vivo Slices Viewer')
 
     # Create image loaders with viewer type specification
+    #comparison_loader = ImageLoader(comparison_loader, 'compare')
     in_vivo_loader = ImageLoader(in_vivo_viewer, 'invivo')
     ex_vivo_loader = ImageLoader(ex_vivo_viewer, 'exvivo')
     
     # Add dock widgets
+    #comparison_viewer.window.add_dock_widget(comparison_viewer, name = 'Image Loader', area = 'right')
     in_vivo_viewer.window.add_dock_widget(in_vivo_loader, name='Image Loader', area='right')
     ex_vivo_viewer.window.add_dock_widget(ex_vivo_loader, name='Image Loader', area='right')
 

@@ -1,12 +1,9 @@
 models:
-  # Cellpose model paths — fill in with absolute paths to your model files
-  2d: ""
-  3d: ""
   # Optional: pre-load image files on startup (leave empty to load manually via GUI)
-  invivo_slices: ""
-  invivo_segmentation: ""
-  exvivo_slices: ""
-  exvivo_segmentation: ""
+  invivo_slices: "/home/jason/albeanu/in-vivo-in-vitro/2P/MAX_Ch2R16bits_top_bulb_crop_8x_groupedz_20.tif"
+  invivo_segmentation: "/home/jason/albeanu/in-vivo-in-vitro/2P/B058/MAX_Ch1R16bits_top_bulb_crop_8x_groupedz_20_cp_masks.tif"
+  exvivo_slices: "/home/jason/albeanu/in-vivo-in-vitro/invitro/B058/dapi_padded_9x_registered/stack.tif"
+  exvivo_segmentation: "/home/jason/albeanu/in-vivo-in-vitro/invitro/B058/max_assigned_all/stack_max_assigned_all.tif"
 
 # Voxel size in micrometers — used to correct the aspect ratio in 3D view.
 # xy: lateral pixel size, z: depth per slice.

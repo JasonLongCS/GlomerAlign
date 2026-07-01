@@ -1,711 +1,731 @@
 import sys
 import os
+import json
+from pathlib import Path
 
-# Force UTF-8 on Windows consoles (cp1252 default can't encode many Unicode chars
-# that napari uses in its error notifications, causing a secondary crash in the logger).
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+# Force UTF-8 on Windows consoles
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 import pandas as pd
 import yaml
-import json
 from tifffile import imread, imwrite
-from scipy.ndimage import rotate
 from skimage.measure import regionprops_table
-import napari
-from PyQt5.QtWidgets import (
-    QPushButton, QVBoxLayout, QWidget, QFileDialog, QInputDialog, QDialog,
-    QScrollArea, QCheckBox, QDialogButtonBox, QHBoxLayout, QMessageBox, QLabel, QSlider
-)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
-# Create matches directory
+import napari
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QFileDialog,
+    QMessageBox,
+    QLabel,
+    QSlider,
+    QDoubleSpinBox,
+    QSpinBox,
+    QGroupBox,
+    QCheckBox,
+)
+
+try:
+    from magicgui import magicgui  # noqa: F401
+    MAGICGUI_AVAILABLE = True
+except Exception:
+    MAGICGUI_AVAILABLE = False
+
+
+# -----------------------------
+# Global paths/config
+# -----------------------------
 MATCHES_DIR = "matches"
 os.makedirs(MATCHES_DIR, exist_ok=True)
 
-# Global config variable
 CONFIG = {}
 TRANSFORM_CONFIG = {}
+TRANSFORM_PATH = None
 
+INVIVO_IMAGE = "In-vivo Image"
+INVIVO_MASK = "In-vivo Mask"
+INVIVO_MATCHES = "In-vivo Matches"
+
+INVITRO_IMAGE = "In-vitro Image"
+INVITRO_MASK = "In-vitro Mask"
+INVITRO_MATCHES = "In-vitro Matches"
+
+
+# -----------------------------
+# Config helpers
+# -----------------------------
 def _get_scale(ndim):
-    """Return a scale tuple (z, y, x) or (y, x) from config, defaulting to 1.0."""
-    scale_cfg = CONFIG.get('scale', {})
-    xy = float(scale_cfg.get('xy', 1.0))
-    z = float(scale_cfg.get('z', 1.0))
+    """Return scale tuple from config. 3D uses (z, y, x), 2D uses (y, x)."""
+    scale_cfg = CONFIG.get("scale", {}) if CONFIG else {}
+    xy = float(scale_cfg.get("xy", 1.0))
+    z = float(scale_cfg.get("z", 1.0))
     if ndim == 2:
         return (xy, xy)
-    return (z, xy, xy)
+    if ndim == 3:
+        return (z, xy, xy)
+    return tuple([1.0] * ndim)
+
 
 def load_global_config(config_path=None):
-    """Load configuration file into global CONFIG variable"""
     global CONFIG
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "config", "config.yaml")
+
     try:
-        with open(config_path, 'r', encoding='utf-8') as file:
-            CONFIG = yaml.safe_load(file)
+        with open(config_path, "r", encoding="utf-8") as f:
+            CONFIG = yaml.safe_load(f) or {}
         print(f"Config loaded from {config_path}")
-        print(f"Config data: {CONFIG}")
         return True
     except FileNotFoundError:
         print(f"Config file not found: {config_path}")
         CONFIG = {"models": {}}
         return False
-    
 
-    # WIP
+
 def load_transform_config(config_path=None):
-    
-    global TRANSFORM_CONFIG
+    global TRANSFORM_CONFIG, TRANSFORM_PATH
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "alignment_transform.json")
+    TRANSFORM_PATH = config_path
+
     try:
-        with open(config_path, 'r', encoding='utf-8') as file:
-            TRANSFORM_CONFIG = json.load(file)
-        print(f"Config loaded from {config_path}")
-        print(f"Config data: {TRANSFORM_CONFIG}")
+        with open(config_path, "r", encoding="utf-8") as f:
+            TRANSFORM_CONFIG = json.load(f)
+        print(f"Transform config loaded from {config_path}")
         return True
     except FileNotFoundError:
-        print(f"Config file not found: {config_path}")
-        CONFIG = {"models": {}}
+        print(f"Transform config not found: {config_path}")
+        TRANSFORM_CONFIG = {}
         return False
 
-def apply_saved_transform(layer):
-    global TRANSFORM_CONFIG
 
-    if not TRANSFORM_CONFIG:
-        print("No transform config loaded.")
-        return
-
-    #if "scale" in TRANSFORM_CONFIG:
-        #layer.scale = tuple(TRANSFORM_CONFIG["scale"])
-
-    if "affine_matrix" in TRANSFORM_CONFIG:
-        layer.affine = np.asarray(TRANSFORM_CONFIG["affine_matrix"])
-
-    layer.refresh()
-    print("Applied saved affine transform.")
-
-
+# -----------------------------
+# Affine helpers
+# -----------------------------
 def rotation_matrix_3d(rx_deg, ry_deg, rz_deg):
     rx, ry, rz = np.deg2rad([rx_deg, ry_deg, rz_deg])
 
     Rx = np.array([
         [1, 0, 0, 0],
         [0, np.cos(rx), -np.sin(rx), 0],
-        [0, np.sin(rx),  np.cos(rx), 0],
+        [0, np.sin(rx), np.cos(rx), 0],
         [0, 0, 0, 1],
-    ])
+    ], dtype=float)
 
     Ry = np.array([
         [np.cos(ry), 0, np.sin(ry), 0],
         [0, 1, 0, 0],
         [-np.sin(ry), 0, np.cos(ry), 0],
         [0, 0, 0, 1],
-    ])
+    ], dtype=float)
 
     Rz = np.array([
         [np.cos(rz), -np.sin(rz), 0, 0],
-        [np.sin(rz),  np.cos(rz), 0, 0],
+        [np.sin(rz), np.cos(rz), 0, 0],
         [0, 0, 1, 0],
         [0, 0, 0, 1],
-    ])
+    ], dtype=float)
 
     return Rz @ Ry @ Rx
 
 
-def make_affine_3d(rx, ry, rz, tz, ty, tx, center_zyx):
+def make_affine_3d(rx, ry, rz, tz, ty, tx, sz, sy, sx, center_zyx):
+    """Make a 4x4 affine for napari 3D data in z, y, x order."""
     cz, cy, cx = center_zyx
 
-    T1 = np.eye(4)
-    T1[:3, 3] = [-cz, -cy, -cx]
+    to_origin = np.eye(4)
+    to_origin[:3, 3] = [-cz, -cy, -cx]
 
-    T2 = np.eye(4)
-    T2[:3, 3] = [cz, cy, cx]
+    back = np.eye(4)
+    back[:3, 3] = [cz, cy, cx]
 
-    T3 = np.eye(4)
-    T3[:3, 3] = [tz, ty, tx]
+    translate = np.eye(4)
+    translate[:3, 3] = [tz, ty, tx]
 
-    R = rotation_matrix_3d(rx, ry, rz)
+    scale = np.eye(4)
+    scale[0, 0] = sz
+    scale[1, 1] = sy
+    scale[2, 2] = sx
 
-    return T3 @ T2 @ R @ T1
-
-
-
-# Dialog for selecting slices
-class SliceSelectorDialog(QDialog):
-    def __init__(self, num_slices, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select Slices")
-        self.selected_slices = set()
-        
-        # Scrollable area for slices
-        layout = QVBoxLayout()
-        scroll_area = QScrollArea(self)
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
-        
-        self.checkboxes = []
-        for i in range(num_slices):
-            checkbox = QCheckBox(f"Slice {i}")
-            checkbox.stateChanged.connect(self.update_selection)
-            scroll_layout.addWidget(checkbox)
-            self.checkboxes.append(checkbox)
-        
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(scroll_widget)
-        layout.addWidget(scroll_area)
-
-        # Select All / Deselect All buttons
-        button_layout = QHBoxLayout()
-        select_all_button = QPushButton("Select All")
-        select_all_button.clicked.connect(self.select_all)
-        button_layout.addWidget(select_all_button)
-
-        deselect_all_button = QPushButton("Deselect All")
-        deselect_all_button.clicked.connect(self.deselect_all)
-        button_layout.addWidget(deselect_all_button)
-        layout.addLayout(button_layout)
-
-        # OK and Cancel buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        
-        self.setLayout(layout)
-
-    def update_selection(self):
-        self.selected_slices = {
-            i for i, checkbox in enumerate(self.checkboxes) if checkbox.isChecked()
-        }
-
-    def select_all(self):
-        for checkbox in self.checkboxes:
-            checkbox.setChecked(True)
-
-    def deselect_all(self):
-        for checkbox in self.checkboxes:
-            checkbox.setChecked(False)
+    rotate = rotation_matrix_3d(rx, ry, rz)
+    return translate @ back @ rotate @ scale @ to_origin
 
 
-class ImageLoader(QWidget):
-    def __init__(self, viewer, viewer_type):
+def add_or_replace_image(viewer, data, name, opacity=1.0):
+    scale = _get_scale(data.ndim)
+    if name in viewer.layers:
+        layer = viewer.layers[name]
+        layer.data = data
+        layer.scale = scale
+        layer.opacity = opacity
+        layer.refresh()
+    else:
+        viewer.add_image(data, name=name, opacity=opacity, scale=scale)
+
+
+def add_or_replace_labels(viewer, data, name, opacity=0.35):
+    scale = _get_scale(data.ndim)
+    if name in viewer.layers:
+        layer = viewer.layers[name]
+        layer.data = data
+        layer.scale = scale
+        layer.opacity = opacity
+        layer.refresh()
+    else:
+        viewer.add_labels(data, name=name, opacity=opacity, scale=scale)
+
+
+def read_tiff(path):
+    """Read TIFF. Kept as a single function so you can swap to memmap later if needed."""
+    return imread(path)
+
+
+# -----------------------------
+# Match handling in one viewer
+# -----------------------------
+class MatchHandler:
+    def __init__(self, viewer):
+        self.viewer = viewer
+        self.clicked = {"in_vivo": None, "ex_vivo": None}
+        self.glomeruli_path = os.path.join(MATCHES_DIR, "glomeruli.csv")
+        self.undo_stack = []
+        self.setup()
+
+    def setup(self):
+        self.viewer.bind_key("h", self.on_key_press, overwrite=True)
+        self.viewer.bind_key("z", self.undo_match, overwrite=True)
+
+    def on_key_press(self, viewer):
+        active_layer = viewer.layers.selection.active
+        if active_layer is None:
+            print("Please select either In-vivo Mask or In-vitro Mask.")
+            return
+
+        if active_layer.name == INVIVO_MASK:
+            viewer_name = "in_vivo"
+        elif active_layer.name == INVITRO_MASK:
+            viewer_name = "ex_vivo"
+        else:
+            print("Please select either In-vivo Mask or In-vitro Mask before pressing h.")
+            return
+
+        pos = viewer.cursor.position
+        scale = active_layer.scale
+        cursor_pos = []
+        for i in range(active_layer.data.ndim):
+            cursor_pos.append(pos[i] / scale[i])
+        cursor_pos = tuple(map(int, np.round(cursor_pos)))
+
+        try:
+            selected_label = active_layer.data[cursor_pos]
+        except IndexError:
+            print(f"Cursor position outside bounds for {active_layer.name}: {cursor_pos}")
+            return
+
+        if selected_label == 0:
+            print("Background selected, label 0. Please select a valid label.")
+            return
+
+        self.on_label_selected(viewer_name, int(selected_label))
+
+    def on_label_selected(self, viewer_name, label):
+        self.clicked[viewer_name] = label
+        print(f"Selected label {label} from {viewer_name}")
+
+        other = "ex_vivo" if viewer_name == "in_vivo" else "in_vivo"
+        if self.clicked[other] is not None:
+            self.record_match()
+
+    def record_match(self):
+        invivo_label = self.clicked["in_vivo"]
+        invitro_label = self.clicked["ex_vivo"]
+        if invivo_label is None or invitro_label is None:
+            print("Need both an in-vivo and in-vitro label selected.")
+            return
+
+        required = [INVIVO_MASK, INVITRO_MASK, INVIVO_MATCHES, INVITRO_MATCHES]
+        missing = [name for name in required if name not in self.viewer.layers]
+        if missing:
+            print(f"Missing layers: {missing}. Load masks and initialize matches first.")
+            return
+
+        invivo_seg = self.viewer.layers[INVIVO_MASK].data
+        invitro_seg = self.viewer.layers[INVITRO_MASK].data
+        invivo_match = self.viewer.layers[INVIVO_MATCHES].data
+        invitro_match = self.viewer.layers[INVITRO_MATCHES].data
+
+        color = invivo_label
+        invivo_match[invivo_seg == invivo_label] = color
+        invitro_match[invitro_seg == invitro_label] = color
+
+        self.viewer.layers[INVIVO_MATCHES].refresh()
+        self.viewer.layers[INVITRO_MATCHES].refresh()
+
+        if os.path.exists(self.glomeruli_path):
+            df = pd.read_csv(self.glomeruli_path, encoding="utf-8")
+        else:
+            df = pd.DataFrame(columns=["invivo", "exvivo", "color"])
+
+        df.loc[len(df)] = [invivo_label, invitro_label, color]
+        df.to_csv(self.glomeruli_path, index=False, encoding="utf-8")
+
+        self.undo_stack.append((invivo_label, invitro_label, color))
+        self.clicked = {"in_vivo": None, "ex_vivo": None}
+
+        imwrite(os.path.join(MATCHES_DIR, "invivo_matches.tif"), invivo_match)
+        imwrite(os.path.join(MATCHES_DIR, "invitro_matches.tif"), invitro_match)
+        print(f"Matched in-vivo {invivo_label} to in-vitro {invitro_label}")
+
+    def undo_match(self, viewer):
+        if not self.undo_stack:
+            print("No matches to undo.")
+            return
+
+        invivo_label, invitro_label, color = self.undo_stack.pop()
+        if INVIVO_MATCHES not in self.viewer.layers or INVITRO_MATCHES not in self.viewer.layers:
+            print("Match layers not found.")
+            return
+
+        invivo_match = self.viewer.layers[INVIVO_MATCHES].data
+        invitro_match = self.viewer.layers[INVITRO_MATCHES].data
+        invivo_match[invivo_match == color] = 0
+        invitro_match[invitro_match == color] = 0
+
+        self.viewer.layers[INVIVO_MATCHES].refresh()
+        self.viewer.layers[INVITRO_MATCHES].refresh()
+
+        if os.path.exists(self.glomeruli_path):
+            df = pd.read_csv(self.glomeruli_path, encoding="utf-8")
+            df = df[~((df["invivo"] == invivo_label) & (df["exvivo"] == invitro_label) & (df["color"] == color))]
+            df.to_csv(self.glomeruli_path, index=False, encoding="utf-8")
+
+        imwrite(os.path.join(MATCHES_DIR, "invivo_matches.tif"), invivo_match)
+        imwrite(os.path.join(MATCHES_DIR, "invitro_matches.tif"), invitro_match)
+        print(f"Undid match between in-vivo {invivo_label} and in-vitro {invitro_label}")
+
+
+class MatchLoader:
+    def __init__(self, viewer):
+        self.viewer = viewer
+
+    def load_matches(self):
+        os.makedirs(MATCHES_DIR, exist_ok=True)
+        base_csv = os.path.join(MATCHES_DIR, "glomeruli.csv")
+        invivo_matches_path = os.path.join(MATCHES_DIR, "invivo_matches.tif")
+        invitro_matches_path = os.path.join(MATCHES_DIR, "invitro_matches.tif")
+
+        if INVIVO_MASK not in self.viewer.layers or INVITRO_MASK not in self.viewer.layers:
+            QMessageBox.warning(None, "Masks Required", "Load both in-vivo and in-vitro masks first.")
+            return
+
+        invivo_seg = self.viewer.layers[INVIVO_MASK].data
+        invitro_seg = self.viewer.layers[INVITRO_MASK].data
+
+        if os.path.exists(base_csv) and os.path.exists(invivo_matches_path) and os.path.exists(invitro_matches_path):
+            print("Loading existing match layers.")
+            invivo_data = read_tiff(invivo_matches_path)
+            invitro_data = read_tiff(invitro_matches_path)
+        else:
+            print("Creating new match layers and CSVs.")
+            invivo_data = np.zeros_like(invivo_seg, dtype=np.uint16)
+            invitro_data = np.zeros_like(invitro_seg, dtype=np.uint16)
+
+            self._get_region_table(invivo_seg).to_csv(
+                os.path.join(MATCHES_DIR, "invivo_glomeruli.csv"), index=False, encoding="utf-8"
+            )
+            self._get_region_table(invitro_seg).to_csv(
+                os.path.join(MATCHES_DIR, "invitro_glomeruli.csv"), index=False, encoding="utf-8"
+            )
+            pd.DataFrame(columns=["invivo", "exvivo", "color"]).to_csv(base_csv, index=False, encoding="utf-8")
+            imwrite(invivo_matches_path, invivo_data)
+            imwrite(invitro_matches_path, invitro_data)
+
+        add_or_replace_labels(self.viewer, invivo_data, INVIVO_MATCHES, opacity=0.7)
+        add_or_replace_labels(self.viewer, invitro_data, INVITRO_MATCHES, opacity=0.7)
+
+    def _get_region_table(self, seg):
+        props = regionprops_table(seg, properties=("label", "centroid"))
+        df = pd.DataFrame(props)
+
+        if seg.ndim == 2:
+            df.columns = ["id", "y", "x"]
+            df["z"] = 0
+        elif seg.ndim == 3:
+            df.columns = ["id", "z", "y", "x"]
+        else:
+            df["id"] = []
+
+        df["color"] = df["id"]
+        df["matched"] = False
+        df["receptor"] = None
+        return df
+
+
+# -----------------------------
+# Main dock widget
+# -----------------------------
+class ControlPanel(QWidget):
+    def __init__(self, viewer):
         super().__init__()
         self.viewer = viewer
-        self.viewer_type = viewer_type  # Either 'invivo' or 'exvivo'
-        self.loaded_layer_name = None  # Track the loaded image layer name
-        self.selected_slices = set()
+        self.match_loader = MatchLoader(viewer)
+        self.match_handler = MatchHandler(viewer)
+        self.current_affine = np.eye(4)
+        self._building_ui = True
 
-        
-        # Layout
         layout = QVBoxLayout()
-        
-        # Buttons for loading images and masks
-        self.load_image_button = QPushButton("Load Image")
-        self.load_image_button.clicked.connect(self.load_image)
-        layout.addWidget(self.load_image_button)
-        
-        self.load_mask_button = QPushButton("Load Mask")
-        self.load_mask_button.clicked.connect(self.load_mask)
-        layout.addWidget(self.load_mask_button)
 
-        self.load_matches_button = QPushButton("Load Matched Data")
-        layout.addWidget(self.load_matches_button)
+        # Load group
+        load_group = QGroupBox("Load Data")
+        load_layout = QVBoxLayout()
 
-        # Save button
-        self.save_button = QPushButton("Save Image")
-        self.save_button.clicked.connect(self.save_image)
-        layout.addWidget(self.save_button)
+        self.load_invivo_image_button = QPushButton("Load In-vivo Image")
+        self.load_invivo_image_button.clicked.connect(lambda: self.load_image(INVIVO_IMAGE))
+        load_layout.addWidget(self.load_invivo_image_button)
 
-        # Select slices button
-        self.select_slices_button = QPushButton("Select Slices")
-        self.select_slices_button.clicked.connect(self.select_slices)
-        layout.addWidget(self.select_slices_button)
+        self.load_invivo_mask_button = QPushButton("Load In-vivo Mask")
+        self.load_invivo_mask_button.clicked.connect(lambda: self.load_mask(INVIVO_MASK))
+        load_layout.addWidget(self.load_invivo_mask_button)
 
-        # Affine rotation sliders
-        layout.addWidget(QLabel("Affine Rotation"))
+        self.load_invitro_image_button = QPushButton("Load In-vitro Image")
+        self.load_invitro_image_button.clicked.connect(lambda: self.load_image(INVITRO_IMAGE))
+        load_layout.addWidget(self.load_invitro_image_button)
 
-        # add selection of current layer to this loop
-        # text here
+        self.load_invitro_mask_button = QPushButton("Load In-vitro Mask")
+        self.load_invitro_mask_button.clicked.connect(lambda: self.load_mask(INVITRO_MASK))
+        load_layout.addWidget(self.load_invitro_mask_button)
 
-        # creating sliders for translation and rotation
-        self.tx_slider = self.make_slider(-1000, 1000, 0)
-        self.ty_slider = self.make_slider(-1000, 1000, 0)
-        self.tz_slider = self.make_slider(-1000, 1000, 0)
+        self.load_from_config_button = QPushButton("Load Images From Config")
+        self.load_from_config_button.clicked.connect(self.load_images_from_config)
+        load_layout.addWidget(self.load_from_config_button)
 
-        self.rx_slider = self.make_slider(-180, 180, 0)
-        self.ry_slider = self.make_slider(-180, 180, 0)
-        self.rz_slider = self.make_slider(-180, 180, 0)
+        self.load_masks_from_config_button = QPushButton("Load Masks From Config")
+        self.load_masks_from_config_button.clicked.connect(self.load_masks_from_config)
+        load_layout.addWidget(self.load_masks_from_config_button)
 
-        layout.addWidget(QLabel("Translate X"))
-        layout.addWidget(self.tx_slider)
-        layout.addWidget(QLabel("Translate Y"))
-        layout.addWidget(self.ty_slider)
-        layout.addWidget(QLabel("Translate Z"))
-        layout.addWidget(self.tz_slider)
+        load_group.setLayout(load_layout)
+        layout.addWidget(load_group)
 
-        layout.addWidget(QLabel("Rotate X"))
-        layout.addWidget(self.rx_slider)
-        layout.addWidget(QLabel("Rotate Y"))
-        layout.addWidget(self.ry_slider)
-        layout.addWidget(QLabel("Rotate Z"))
-        layout.addWidget(self.rz_slider)
+        # View group
+        view_group = QGroupBox("View")
+        view_layout = QVBoxLayout()
+        self.ndisplay_checkbox = QCheckBox("3D display")
+        self.ndisplay_checkbox.setChecked(False)
+        self.ndisplay_checkbox.stateChanged.connect(self.toggle_3d)
+        view_layout.addWidget(self.ndisplay_checkbox)
+        view_group.setLayout(view_layout)
+        layout.addWidget(view_group)
 
-        self.tx_slider.valueChanged.connect(self.update_affine_transformation)
-        self.ty_slider.valueChanged.connect(self.update_affine_transformation)
-        self.tz_slider.valueChanged.connect(self.update_affine_transformation)
-        self.rx_slider.valueChanged.connect(self.update_affine_transformation)
-        self.ry_slider.valueChanged.connect(self.update_affine_transformation)
-        self.rz_slider.valueChanged.connect(self.update_affine_transformation)
+        # Match group
+        match_group = QGroupBox("Matching")
+        match_layout = QVBoxLayout()
+        self.load_matches_button = QPushButton("Load / Initialize Matches")
+        self.load_matches_button.clicked.connect(self.match_loader.load_matches)
+        match_layout.addWidget(self.load_matches_button)
 
-        # applies previously saved affine transformation from import
-        self.apply_affine_button = QPushButton("Apply Saved Affine")
-        self.apply_affine_button.clicked.connect(self.apply_saved_affine)
-        layout.addWidget(self.apply_affine_button)
+        self.save_matches_button = QPushButton("Save Matches")
+        self.save_matches_button.clicked.connect(self.save_matches)
+        match_layout.addWidget(self.save_matches_button)
+
+        match_layout.addWidget(QLabel("Select a mask layer and press h to pick labels. Press z to undo."))
+        match_group.setLayout(match_layout)
+        layout.addWidget(match_group)
+
+        # Transform group
+        transform_group = QGroupBox("Transform In-vitro Image/Mask")
+        transform_layout = QVBoxLayout()
+
+        self.tx_slider, self.tx_spin = self.make_slider_spin("Translate X", -5000, 5000, 0, transform_layout)
+        self.ty_slider, self.ty_spin = self.make_slider_spin("Translate Y", -5000, 5000, 0, transform_layout)
+        self.tz_slider, self.tz_spin = self.make_slider_spin("Translate Z", -5000, 5000, 0, transform_layout)
+
+        self.rx_slider, self.rx_spin = self.make_slider_spin("Rotate X", -180, 180, 0, transform_layout)
+        self.ry_slider, self.ry_spin = self.make_slider_spin("Rotate Y", -180, 180, 0, transform_layout)
+        self.rz_slider, self.rz_spin = self.make_slider_spin("Rotate Z", -180, 180, 0, transform_layout)
+
+        self.sx_spin = self.make_double_spin("Scale X", 0.01, 20.0, 1.0, transform_layout)
+        self.sy_spin = self.make_double_spin("Scale Y", 0.01, 20.0, 1.0, transform_layout)
+        self.sz_spin = self.make_double_spin("Scale Z", 0.01, 20.0, 1.0, transform_layout)
+
+        self.apply_saved_button = QPushButton("Apply Saved Transform")
+        self.apply_saved_button.clicked.connect(self.apply_saved_transform)
+        transform_layout.addWidget(self.apply_saved_button)
+
+        self.save_transform_button = QPushButton("Save Transform")
+        self.save_transform_button.clicked.connect(self.save_transform)
+        transform_layout.addWidget(self.save_transform_button)
+
+        self.reset_transform_button = QPushButton("Reset Transform Controls")
+        self.reset_transform_button.clicked.connect(self.reset_transform_controls)
+        transform_layout.addWidget(self.reset_transform_button)
+
+        transform_group.setLayout(transform_layout)
+        layout.addWidget(transform_group)
+
+        # Save group
+        save_group = QGroupBox("Save Layers")
+        save_layout = QVBoxLayout()
+        self.save_invivo_mask_button = QPushButton("Save In-vivo Mask")
+        self.save_invivo_mask_button.clicked.connect(lambda: self.save_layer(INVIVO_MASK))
+        save_layout.addWidget(self.save_invivo_mask_button)
+
+        self.save_invitro_mask_button = QPushButton("Save In-vitro Mask")
+        self.save_invitro_mask_button.clicked.connect(lambda: self.save_layer(INVITRO_MASK))
+        save_layout.addWidget(self.save_invitro_mask_button)
+
+        self.save_selected_button = QPushButton("Save Selected Layer")
+        self.save_selected_button.clicked.connect(self.save_selected_layer)
+        save_layout.addWidget(self.save_selected_button)
+        save_group.setLayout(save_layout)
+        layout.addWidget(save_group)
 
         self.setLayout(layout)
-        
-        # Load config data appropriate for this viewer type
-        self.load_config_data()
-        
-    # applies saved affine transformation through the click of a button.
-    def apply_saved_affine(self):
-        if self.loaded_layer_name is None:
-            QMessageBox.warning(self, "Warning", "No image loaded.")
-            return
+        self._building_ui = False
 
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-        except KeyError:
-            QMessageBox.warning(self, "Warning", f"Layer '{self.loaded_layer_name}' not found.")
-            return
+        if MAGICGUI_AVAILABLE:
+            print("magicgui is available, but this single-viewer version uses Qt widgets for direct slider control.")
 
-        apply_saved_transform(layer)
-
-    def load_config_data(self):
-        """Load data from config specific to this viewer type (invivo/exvivo)"""
-        global CONFIG
-        
-        if not CONFIG:
-            print("No configuration loaded")
-            return
-            
-        models = CONFIG.get('models', {})
-        
-        # Determine which data to load based on viewer type
-        if self.viewer_type == 'exvivo':
-            exvivo_slices = models.get('exvivo_slices', '')
-            if exvivo_slices and os.path.exists(exvivo_slices):
-                image_data = imread(exvivo_slices)
-                self.loaded_layer_name = 'Loaded Image'
-                self.viewer.add_image(image_data, name=self.loaded_layer_name, opacity=1,
-                                      scale=_get_scale(image_data.ndim))
-                print(f"Loaded ex vivo stack from {exvivo_slices}")
-
-        elif self.viewer_type == 'invivo':
-            invivo_slices = models.get('invivo_slices', '')
-            if invivo_slices and os.path.exists(invivo_slices):
-                slices = imread(invivo_slices)
-                self.loaded_layer_name = 'Loaded Image'
-                self.viewer.add_image(slices, name=self.loaded_layer_name, opacity=1,
-                                      scale=_get_scale(slices.ndim))
-                print(f"Loaded in vivo slices from {invivo_slices}")
-
-        elif self.viewer_type == 'compare':
-            compare_slices = models.get('compare_slices', '')
-            if compare_slices and os.path.exists(compare_slices):
-                slices = imread(compare_slices)
-                self.loaded_layer_name = 'Loaded Image'
-                self.viewer.add_image(slices, name=self.loaded_layer_name, opacity=1,
-                                      scale=_get_scale(slices.ndim))
-                print(f"Loaded in vivo slices from {invivo_slices}")
-                
-    def load_mask(self):
-        mask_path, _ = QFileDialog.getOpenFileName(self, "Open Mask File", filter="TIFF Files (*.tif *.tiff)")
-        if mask_path:
-            mask_data = imread(mask_path)
-            self.viewer.add_labels(mask_data, name='Mask', opacity=0.3,
-                                   scale=_get_scale(3))
-
-    def save_image(self):
-        if self.loaded_layer_name is None:
-            print("No image has been loaded to save.")
-            return
-        
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-        except KeyError:
-            print(f"Layer '{self.loaded_layer_name}' not found.")
-            return
-
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Image As", filter="TIFF Files (*.tif *.tiff)")
-        if save_path:
-            imwrite(save_path, layer.data)
-            print(f"Image saved to {save_path}")
-
-    def select_slices(self):
-        if self.loaded_layer_name is None:
-            print("No image loaded to select slices.")
-            return
-        
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-        except KeyError:
-            print(f"Layer '{self.loaded_layer_name}' not found.")
-            return
-
-        # Open the slice selector dialog
-        dialog = SliceSelectorDialog(num_slices=layer.data.shape[0])
-        if dialog.exec_():
-            self.selected_slices = dialog.selected_slices
-            print(f"Selected slices: {self.selected_slices}")
-
-    # helper method to make a slider for rotation and translation (sliding later)
-    def make_slider(self, min_val, max_val, default):
+    def make_slider_spin(self, label, min_val, max_val, default, parent_layout):
+        parent_layout.addWidget(QLabel(label))
+        row = QHBoxLayout()
         slider = QSlider(Qt.Horizontal)
         slider.setMinimum(min_val)
         slider.setMaximum(max_val)
         slider.setValue(default)
         slider.setTickInterval(15)
         slider.setTickPosition(QSlider.TicksBelow)
-        return slider
 
-    # refresh based on rotation/ will rewrite based on translation
-    def update_affine_transformation(self):
-        if self.loaded_layer_name is None:
+        spin = QSpinBox()
+        spin.setMinimum(min_val)
+        spin.setMaximum(max_val)
+        spin.setValue(default)
+
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        slider.valueChanged.connect(self.update_affine_transformation)
+        spin.valueChanged.connect(self.update_affine_transformation)
+
+        row.addWidget(slider)
+        row.addWidget(spin)
+        parent_layout.addLayout(row)
+        return slider, spin
+
+    def make_double_spin(self, label, min_val, max_val, default, parent_layout):
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label))
+        spin = QDoubleSpinBox()
+        spin.setMinimum(min_val)
+        spin.setMaximum(max_val)
+        spin.setSingleStep(0.01)
+        spin.setDecimals(3)
+        spin.setValue(default)
+        spin.valueChanged.connect(self.update_affine_transformation)
+        row.addWidget(spin)
+        parent_layout.addLayout(row)
+        return spin
+
+    def toggle_3d(self):
+        self.viewer.dims.ndisplay = 3 if self.ndisplay_checkbox.isChecked() else 2
+
+    def load_image(self, layer_name):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image File", filter="TIFF Files (*.tif *.tiff)")
+        if not file_path:
             return
+        data = read_tiff(file_path)
+        add_or_replace_image(self.viewer, data, layer_name, opacity=0.65 if "vitro" in layer_name else 1.0)
+        print(f"Loaded {layer_name}: {file_path}")
 
-        try:
-            layer = self.viewer.layers[self.loaded_layer_name]
-            if self.viewer.layers["Mask"]:
-                mask = self.viewer.layers["Mask"]
-        except KeyError:
+    def load_mask(self, layer_name):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Mask File", filter="TIFF Files (*.tif *.tiff)")
+        if not file_path:
             return
-        
-        tx = self.tx_slider.value()
-        ty = self.ty_slider.value()
-        tz = self.tz_slider.value()
+        data = read_tiff(file_path)
+        add_or_replace_labels(self.viewer, data, layer_name, opacity=0.35)
+        print(f"Loaded {layer_name}: {file_path}")
 
-        rx = self.rx_slider.value()
-        ry = self.ry_slider.value()
-        rz = self.rz_slider.value()
+    def load_images_from_config(self):
+        models = CONFIG.get("models", {}) if CONFIG else {}
+        pairs = [
+            (INVIVO_IMAGE, models.get("invivo_slices", "")),
+            (INVITRO_IMAGE, models.get("exvivo_slices", "") or models.get("invitro_slices", "")),
+        ]
+        for layer_name, path in pairs:
+            if path and os.path.exists(path):
+                data = read_tiff(path)
+                add_or_replace_image(self.viewer, data, layer_name, opacity=0.65 if layer_name == INVITRO_IMAGE else 1.0)
+                print(f"Loaded {layer_name} from config: {path}")
+            else:
+                print(f"No valid config path for {layer_name}: {path}")
 
-        center = (np.array(layer.data.shape) - 1) / 2
-        #change this
-        layer.affine = make_affine_3d(rx, ry, rz, tz, ty, tx, center)
-        layer.refresh()
-        if mask:
-            mask.affine = make_affine_3d(rx, ry, rz, tz, ty, tx, center)
-            mask.refresh()
+    def load_masks_from_config(self):
+        models = CONFIG.get("models", {}) if CONFIG else {}
+        # These key names are flexible so your config does not need to be exact.
+        pairs = [
+            (INVIVO_MASK, models.get("invivo_mask", "") or models.get("invivo_masks", "")),
+            (INVITRO_MASK, models.get("exvivo_mask", "") or models.get("exvivo_masks", "") or models.get("invitro_mask", "") or models.get("invitro_masks", "")),
+        ]
+        for layer_name, path in pairs:
+            if path and os.path.exists(path):
+                data = read_tiff(path)
+                add_or_replace_labels(self.viewer, data, layer_name, opacity=0.35)
+                print(f"Loaded {layer_name} from config: {path}")
+            else:
+                print(f"No valid config path for {layer_name}: {path}")
 
-class MatchHandler:
-    def __init__(self, in_vivo_viewer, ex_vivo_viewer):
-        self.in_vivo_viewer = in_vivo_viewer
-        self.ex_vivo_viewer = ex_vivo_viewer
-        self.clicked = {'in_vivo': None, 'ex_vivo': None}
-        self.glomeruli_path = os.path.join(MATCHES_DIR, 'glomeruli.csv')
-        self.undo_stack = []
-        self.setup()
+    def get_transform_values(self):
+        return {
+            "tx": self.tx_spin.value(),
+            "ty": self.ty_spin.value(),
+            "tz": self.tz_spin.value(),
+            "rx": self.rx_spin.value(),
+            "ry": self.ry_spin.value(),
+            "rz": self.rz_spin.value(),
+            "sx": self.sx_spin.value(),
+            "sy": self.sy_spin.value(),
+            "sz": self.sz_spin.value(),
+        }
 
-    def setup(self):
-        # Bind keys for matching and undo
-        self.in_vivo_viewer.bind_key('h', self.on_key_press)
-        self.ex_vivo_viewer.bind_key('h', self.on_key_press)
-        self.in_vivo_viewer.bind_key('z', self.undo_match)
-        self.ex_vivo_viewer.bind_key('z', self.undo_match)
+    def compute_current_affine(self):
+        if INVITRO_IMAGE in self.viewer.layers:
+            shape = self.viewer.layers[INVITRO_IMAGE].data.shape
+        elif INVITRO_MASK in self.viewer.layers:
+            shape = self.viewer.layers[INVITRO_MASK].data.shape
+        else:
+            return np.eye(4)
 
-    def on_key_press(self, viewer):
-        # Determine which viewer was used
-        viewer_name = 'in_vivo' if viewer == self.in_vivo_viewer else 'ex_vivo'
-        
-        # Get active layer and selected label
-        active_layer = viewer.layers.selection.active
-        if active_layer is None or active_layer.name != 'Mask':
-            print("Please select a label from the Mask layer")
-            return
-        #print(active_layer.data.shape)
-        
-        # Get the label at the current cursor position
-        pos = viewer.cursor.position
-        # divide the cursor position by scale to get actual matching mask labelss
-        z_scale, x_scale, y_scale = _get_scale(3)
-        cursor_pos = (
-            pos[0] / z_scale,
-            pos[1] / x_scale,
-            pos[2] / y_scale,
+        if len(shape) == 2:
+            # Treat 2D as z=1 for affine consistency.
+            center = np.array([0, shape[0] - 1, shape[1] - 1], dtype=float) / 2
+        else:
+            center = (np.array(shape[:3], dtype=float) - 1) / 2
+
+        vals = self.get_transform_values()
+        return make_affine_3d(
+            vals["rx"], vals["ry"], vals["rz"],
+            vals["tz"], vals["ty"], vals["tx"],
+            vals["sz"], vals["sy"], vals["sx"],
+            center,
         )
-        actual_cursor_pos = tuple(map(int, np.round(cursor_pos)))
-        print(actual_cursor_pos)
-        try:
-            selected_label = active_layer.data[actual_cursor_pos]
-            if selected_label == 0:  # Background
-                print("Background selected (label 0), please select a valid label")
-                return
-                
-            self.on_label_selected(viewer_name, selected_label)
-        except IndexError:
-            print(f"Cursor position outside image bounds in {viewer_name}")
-            
-    def on_label_selected(self, viewer_name, label):
-        """Store the selected label and its viewer"""
-        self.clicked[viewer_name] = label
-        print(f"Selected label {label} from {viewer_name} viewer")
-        
-        # Visual feedback
-        viewer = self.in_vivo_viewer if viewer_name == 'in_vivo' else self.ex_vivo_viewer
-        mask_layer = viewer.layers['Mask']
-        
-        # Highlight the label temporarily
-        temp_data = np.zeros_like(mask_layer.data)
-        temp_data[mask_layer.data == label] = 1
-        viewer.add_labels(temp_data, name="Selected", opacity=0.7, scale=_get_scale(temp_data.ndim))
-        #QMessageBox.information(viewer.window._qt_window, "Label Selected", 
-        #                       f"Selected label {label}. Press 'm' in the other viewer to complete #match.")
-        
-        # Remove the highlight after a moment
-        viewer.layers.remove('Selected')
-        
-        # Check if we can make a match
-        other = 'ex_vivo' if viewer_name == 'in_vivo' else 'in_vivo'
-        if self.clicked[other] is not None:
-            self.record_match()
 
-    def record_match(self):
-        """Record a match between selected labels"""
-        v1, v2 = self.clicked['in_vivo'], self.clicked['ex_vivo']
-        if v1 is None or v2 is None:
-            print("Need two labels selected.")
+    def update_affine_transformation(self):
+        if getattr(self, "_building_ui", False):
+            return
+        affine = self.compute_current_affine()
+        self.current_affine = affine
+
+        for layer_name in [INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES]:
+            if layer_name in self.viewer.layers:
+                self.viewer.layers[layer_name].affine = affine
+                self.viewer.layers[layer_name].refresh()
+
+    def apply_saved_transform(self):
+        global TRANSFORM_CONFIG
+        if not TRANSFORM_CONFIG:
+            QMessageBox.warning(self, "No Transform", "No transform config was loaded.")
             return
 
-        # Get the appropriate layers
-        if 'Mask' not in self.in_vivo_viewer.layers or 'Mask' not in self.ex_vivo_viewer.layers:
-            print("Mask layers not found in both viewers")
-            return
-            
-        if 'matches' not in self.in_vivo_viewer.layers or 'matches' not in self.ex_vivo_viewer.layers:
-            print("Matches layers not found. Please load matched data first.")
+        if "parameters" in TRANSFORM_CONFIG:
+            params = TRANSFORM_CONFIG["parameters"]
+            self.set_transform_controls(params)
+            self.update_affine_transformation()
+            print("Applied saved transform parameters.")
             return
 
-        invivo_seg = self.in_vivo_viewer.layers['Mask'].data
-        exvivo_seg = self.ex_vivo_viewer.layers['Mask'].data
-        invivo_match = self.in_vivo_viewer.layers['matches'].data
-        exvivo_match = self.ex_vivo_viewer.layers['matches'].data
-
-        # Use invivo label as color for both matches
-        color = v1
-
-        # Update the matches layers
-        invivo_match[invivo_seg == v1] = color
-        exvivo_match[exvivo_seg == v2] = color
-
-        # Refresh layers
-        self.in_vivo_viewer.layers['matches'].refresh()
-        self.ex_vivo_viewer.layers['matches'].refresh()
-
-        # Visual feedback for successful match
-        #QMessageBox.information(None, "Match Recorded", 
-        #                       f"Matched invivo label {v1} with exvivo label {v2}")
-
-        # Update CSV file
-        if os.path.exists(self.glomeruli_path):
-            df = pd.read_csv(self.glomeruli_path, encoding='utf-8')
-        else:
-            df = pd.DataFrame(columns=['invivo', 'exvivo', 'color'])
-            
-        # Add new match to dataframe
-        df.loc[len(df)] = [v1, v2, color]
-        df.to_csv(self.glomeruli_path, index=False, encoding='utf-8')
-
-        # Save match to undo stack
-        self.undo_stack.append((v1, v2, color))
-        
-        # Reset clicked labels
-        self.clicked = {'in_vivo': None, 'ex_vivo': None}
-        
-        # Save updated match images
-        invivo_matches_path = os.path.join(MATCHES_DIR, 'invivo_matches.tif')
-        exvivo_matches_path = os.path.join(MATCHES_DIR, 'exvivo_matches.tif')
-        imwrite(invivo_matches_path, invivo_match)
-        imwrite(exvivo_matches_path, exvivo_match)
-
-    def undo_match(self, viewer):
-        """Undo the last match"""
-        if not self.undo_stack:
-            QMessageBox.information(None, "Nothing to Undo", "No matches to undo.")
-            return
-            
-        v1, v2, color = self.undo_stack.pop()
-
-        # Get match layers
-        if 'matches' not in self.in_vivo_viewer.layers or 'matches' not in self.ex_vivo_viewer.layers:
-            print("Match layers not found")
-            return
-            
-        invivo_match = self.in_vivo_viewer.layers['matches'].data
-        exvivo_match = self.ex_vivo_viewer.layers['matches'].data
-
-        # Remove the match by setting pixels with the color back to 0
-        invivo_match[invivo_match == color] = 0
-        exvivo_match[exvivo_match == color] = 0
-        
-        # Refresh layers
-        self.in_vivo_viewer.layers['matches'].refresh()
-        self.ex_vivo_viewer.layers['matches'].refresh()
-
-        # Update CSV file
-        if os.path.exists(self.glomeruli_path):
-            df = pd.read_csv(self.glomeruli_path, encoding='utf-8')
-            # Remove the match
-            df = df[~((df['invivo'] == v1) & (df['exvivo'] == v2) & (df['color'] == color))]
-            df.to_csv(self.glomeruli_path, index=False, encoding='utf-8')
-            
-        # Save updated match images
-        invivo_matches_path = os.path.join(MATCHES_DIR, 'invivo_matches.tif')
-        exvivo_matches_path = os.path.join(MATCHES_DIR, 'exvivo_matches.tif')
-        imwrite(invivo_matches_path, invivo_match)
-        imwrite(exvivo_matches_path, exvivo_match)
-
-        QMessageBox.information(None, "Match Undone", 
-                               f"Undid match between invivo {v1} and exvivo {v2}")
-
-
-class MatchLoader:
-    def __init__(self, in_vivo_viewer, ex_vivo_viewer):
-        self.in_vivo_viewer = in_vivo_viewer
-        self.ex_vivo_viewer = ex_vivo_viewer
-
-    def load_matches(self):
-        """Load existing matches or create initial match files"""
-        os.makedirs(MATCHES_DIR, exist_ok=True)
-        base_path = os.path.join(MATCHES_DIR, 'glomeruli.csv')
-        
-        # Check for required mask layers
-        if 'Mask' not in self.in_vivo_viewer.layers or 'Mask' not in self.ex_vivo_viewer.layers:
-            QMessageBox.warning(None, "Masks Required", 
-                              "Please load mask layers in both viewers first")
+        if "affine_matrix" in TRANSFORM_CONFIG:
+            affine = np.asarray(TRANSFORM_CONFIG["affine_matrix"], dtype=float)
+            self.current_affine = affine
+            for layer_name in [INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES]:
+                if layer_name in self.viewer.layers:
+                    self.viewer.layers[layer_name].affine = affine
+                    self.viewer.layers[layer_name].refresh()
+            print("Applied saved affine matrix.")
             return
 
-        invivo_seg = self.in_vivo_viewer.layers['Mask'].data
-        exvivo_seg = self.ex_vivo_viewer.layers['Mask'].data
+        QMessageBox.warning(self, "Invalid Transform", "Transform config has no parameters or affine_matrix.")
 
-        # Paths for match files
-        invivo_matches_path = os.path.join(MATCHES_DIR, 'invivo_matches.tif')
-        exvivo_matches_path = os.path.join(MATCHES_DIR, 'exvivo_maches.tif')
-        invivo_glomeruli_path = os.path.join(MATCHES_DIR, 'invivo_glomeruli.csv')
-        exvivo_glomeruli_path = os.path.join(MATCHES_DIR, 'exvivo_glomeruli.csv')
+    def set_transform_controls(self, params):
+        self.tx_spin.setValue(int(params.get("tx", 0)))
+        self.ty_spin.setValue(int(params.get("ty", 0)))
+        self.tz_spin.setValue(int(params.get("tz", 0)))
+        self.rx_spin.setValue(int(params.get("rx", 0)))
+        self.ry_spin.setValue(int(params.get("ry", 0)))
+        self.rz_spin.setValue(int(params.get("rz", 0)))
+        self.sx_spin.setValue(float(params.get("sx", 1.0)))
+        self.sy_spin.setValue(float(params.get("sy", 1.0)))
+        self.sz_spin.setValue(float(params.get("sz", 1.0)))
 
-        if os.path.exists(base_path):
-            print("Loading existing match data...")
-            try:
-                # Load match data
-                invivo_data = imread(invivo_matches_path)
-                exvivo_data = imread(exvivo_matches_path)
-                QMessageBox.information(None, "Match Data Loaded", 
-                                      "Loaded existing match data successfully")
-            except Exception as e:
-                print(f"Error loading match data: {e}")
-                QMessageBox.warning(None, "Error", f"Error loading match data: {e}")
-                return
-        else:
-            print("Creating initial match files...")
-            try:
-                # Create region tables
-                invivo_df = self._get_region_table(invivo_seg)
-                exvivo_df = self._get_region_table(exvivo_seg)
-                
-                # Save to CSV
-                invivo_df.to_csv(invivo_glomeruli_path, index=False, encoding='utf-8')
-                exvivo_df.to_csv(exvivo_glomeruli_path, index=False, encoding='utf-8')
-                
-                # Create empty matches CSV
-                pd.DataFrame(columns=['invivo', 'exvivo', 'color']).to_csv(base_path, index=False, encoding='utf-8')
-                
-                # Create empty match layers
-                invivo_data = np.zeros_like(invivo_seg)
-                exvivo_data = np.zeros_like(exvivo_seg)
-                
-                # Save match TIFFs
-                imwrite(invivo_matches_path, invivo_data)
-                imwrite(exvivo_matches_path, exvivo_data)
-                
-                QMessageBox.information(None, "Match Data Created", 
-                                      "Created new match data files successfully")
-            except Exception as e:
-                print(f"Error creating match data: {e}")
-                QMessageBox.warning(None, "Error", f"Error creating match data: {e}")
-                return
+    def save_transform(self):
+        global TRANSFORM_CONFIG
+        affine = self.compute_current_affine()
+        TRANSFORM_CONFIG = {
+            "parameters": self.get_transform_values(),
+            "affine_matrix": affine.tolist(),
+            "applies_to": [INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES],
+            "axis_order": "zyx for translation/scale center, rotations are rx/ry/rz degrees",
+        }
 
-        # Add or update match layers in viewers
-        if 'matches' in self.in_vivo_viewer.layers:
-            self.in_vivo_viewer.layers['matches'].data = invivo_data
-            self.in_vivo_viewer.layers['matches'].refresh()
-        else:
-            self.in_vivo_viewer.add_labels(invivo_data, name='matches', opacity=1.0,
-                                           scale=_get_scale(invivo_data.ndim))
+        save_path = TRANSFORM_PATH or os.path.join(os.path.dirname(__file__), "alignment_transform.json")
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(TRANSFORM_CONFIG, f, indent=2)
+        print(f"Saved transform to {save_path}")
 
-        if 'matches' in self.ex_vivo_viewer.layers:
-            self.ex_vivo_viewer.layers['matches'].data = exvivo_data
-            self.ex_vivo_viewer.layers['matches'].refresh()
-        else:
-            self.ex_vivo_viewer.add_labels(exvivo_data, name='matches', opacity=1.0,
-                                           scale=_get_scale(exvivo_data.ndim))
+    def reset_transform_controls(self):
+        self.set_transform_controls({
+            "tx": 0, "ty": 0, "tz": 0,
+            "rx": 0, "ry": 0, "rz": 0,
+            "sx": 1.0, "sy": 1.0, "sz": 1.0,
+        })
+        self.update_affine_transformation()
 
-    def _get_region_table(self, seg):
-        """Extract region properties from segmentation"""
-        # Handle 2D vs 3D data
-        if seg.ndim == 2:
-            props = regionprops_table(seg, properties=('label', 'centroid'))
-            df = pd.DataFrame(props)
-            df.columns = ['id', 'y', 'x']
-            # Add z column with zeros for 2D data
-            df['z'] = 0
-        else:
-            props = regionprops_table(seg, properties=('label', 'centroid'))
-            df = pd.DataFrame(props)
-            df.columns = ['id', 'z', 'y', 'x']
-            
-        # Add additional columns
-        df['color'] = df['id']  # Use label ID as initial color
-        df['matched'] = False   # Initial match status
-        df['receptor'] = None   # Receptor type (to be filled later)
-        
-        return df
+    def save_layer(self, layer_name):
+        if layer_name not in self.viewer.layers:
+            QMessageBox.warning(self, "Layer Missing", f"{layer_name} is not loaded.")
+            return
+        save_path, _ = QFileDialog.getSaveFileName(self, f"Save {layer_name}", filter="TIFF Files (*.tif *.tiff)")
+        if not save_path:
+            return
+        imwrite(save_path, self.viewer.layers[layer_name].data)
+        print(f"Saved {layer_name} to {save_path}")
+
+    def save_selected_layer(self):
+        layer = self.viewer.layers.selection.active
+        if layer is None:
+            QMessageBox.warning(self, "No Selection", "No active layer selected.")
+            return
+        save_path, _ = QFileDialog.getSaveFileName(self, f"Save {layer.name}", filter="TIFF Files (*.tif *.tiff)")
+        if not save_path:
+            return
+        imwrite(save_path, layer.data)
+        print(f"Saved {layer.name} to {save_path}")
+
+    def save_matches(self):
+        if INVIVO_MATCHES in self.viewer.layers:
+            imwrite(os.path.join(MATCHES_DIR, "invivo_matches.tif"), self.viewer.layers[INVIVO_MATCHES].data)
+        if INVITRO_MATCHES in self.viewer.layers:
+            imwrite(os.path.join(MATCHES_DIR, "invitro_matches.tif"), self.viewer.layers[INVITRO_MATCHES].data)
+        print("Saved match layers.")
+
+
+# Keep refs alive
+APP_REFS = []
 
 
 def main():
-    """Main function to start the GlomerAlign application"""
-    # Load configuration
     load_global_config()
     load_transform_config()
 
-    # Create the viewers
-    #comparison_viewer = napari.Viewer(title='Comparison Viewer')
-    in_vivo_viewer = napari.Viewer(title='In Vivo Brain Viewer')
-    ex_vivo_viewer = napari.Viewer(title='Ex Vivo Slices Viewer')
+    viewer = napari.Viewer(title="GlomerAlign Single Viewer", ndisplay=2)
+    panel = ControlPanel(viewer)
+    viewer.window.add_dock_widget(panel, name="GlomerAlign Controls", area="right")
 
-    # Create image loaders with viewer type specification
-    #comparison_loader = ImageLoader(comparison_loader, 'compare')
-    in_vivo_loader = ImageLoader(in_vivo_viewer, 'invivo')
-    ex_vivo_loader = ImageLoader(ex_vivo_viewer, 'exvivo')
-    
-    # Add dock widgets
-    #comparison_viewer.window.add_dock_widget(comparison_viewer, name = 'Image Loader', area = 'right')
-    in_vivo_viewer.window.add_dock_widget(in_vivo_loader, name='Image Loader', area='right')
-    ex_vivo_viewer.window.add_dock_widget(ex_vivo_loader, name='Image Loader', area='right')
-
-    # Create match loader and connect to buttons
-    match_loader = MatchLoader(in_vivo_viewer, ex_vivo_viewer)
-    in_vivo_loader.load_matches_button.clicked.connect(match_loader.load_matches)
-    ex_vivo_loader.load_matches_button.clicked.connect(match_loader.load_matches)
-
-    # Create match handler for interactions
-    match_handler = MatchHandler(in_vivo_viewer, ex_vivo_viewer)
-
-    # Run the application
+    APP_REFS.extend([viewer, panel, panel.match_loader, panel.match_handler])
     napari.run()
 
 

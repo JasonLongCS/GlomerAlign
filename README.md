@@ -49,7 +49,7 @@ To start GlomerAlign, simply run:
 python gui.py
 ```
 
-This will open two Napari viewers: one for in vivo brain images and one for ex vivo slices.
+This will open three Napari viewers: one for in vivo brain images, one for ex vivo slices, and one for aligning the two volumes.
 WIP: three viewers, one additional viewer for aligning orientation in both in vivo (2P) and ex vivo (in vitro) volumes to assist in glomeruli matching. 
 
 ## Features

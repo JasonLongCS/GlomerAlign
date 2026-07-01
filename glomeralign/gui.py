@@ -667,7 +667,8 @@ class ControlPanel(QWidget):
         spin.setMinimum(min_val)
         spin.setMaximum(max_val)
         spin.setValue(default)
-
+        spin.setSingleStep(10)
+        
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
         slider.valueChanged.connect(self.update_affine_transformation)

@@ -14,6 +14,7 @@ import pandas as pd
 import yaml
 from tifffile import imread, imwrite
 from skimage.measure import regionprops_table
+from skimage.transform import PiecewiseAffineTransform, warp
 
 import napari
 from PyQt5.QtCore import Qt
@@ -30,6 +31,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QGroupBox,
     QCheckBox,
+    QInputDialog,
 )
 
 try:
@@ -56,6 +58,11 @@ INVIVO_MATCHES = "In-vivo Matches"
 INVITRO_IMAGE = "In-vitro Image"
 INVITRO_MASK = "In-vitro Mask"
 INVITRO_MATCHES = "In-vitro Matches"
+
+DEFORM_SRC_POINTS = "Deform Source Points"
+DEFORM_DST_POINTS = "Deform Destination Points"
+DEFORM_GRID = "Deform Grid"
+DEFORMATION_PATH = None
 
 
 # -----------------------------
@@ -185,6 +192,112 @@ def add_or_replace_labels(viewer, data, name, opacity=0.35):
 def read_tiff(path):
     """Read TIFF. Kept as a single function so you can swap to memmap later if needed."""
     return imread(path)
+
+
+
+
+# -----------------------------
+# Slice deformation helpers
+# -----------------------------
+def current_z_index(viewer):
+    """Return the current z index for 3D data shown in 2D mode."""
+    try:
+        z = int(round(viewer.dims.current_step[0]))
+    except Exception:
+        z = 0
+    return max(z, 0)
+
+
+def get_layer_slice_2d(layer, z):
+    data = layer.data
+    if data.ndim == 2:
+        return data
+    z = min(max(int(z), 0), data.shape[0] - 1)
+    return data[z]
+
+
+def set_layer_slice_2d(layer, z, slice_data):
+    data = layer.data
+    if data.ndim == 2:
+        layer.data = slice_data.astype(data.dtype, copy=False)
+    else:
+        z = min(max(int(z), 0), data.shape[0] - 1)
+        data[z] = slice_data.astype(data.dtype, copy=False)
+        layer.refresh()
+
+
+def make_regular_grid_points(shape_yx, spacing):
+    """Return points in napari 2D coordinates, y/x order."""
+    height, width = shape_yx
+    spacing = max(int(spacing), 2)
+
+    ys = list(range(0, height, spacing))
+    xs = list(range(0, width, spacing))
+    if ys[-1] != height - 1:
+        ys.append(height - 1)
+    if xs[-1] != width - 1:
+        xs.append(width - 1)
+
+    points = []
+    for y in ys:
+        for x in xs:
+            points.append([float(y), float(x)])
+    return np.asarray(points, dtype=float), ys, xs
+
+
+def make_grid_lines_from_points(points_yx, ys, xs):
+    """Create napari Shapes paths from grid points in y/x order."""
+    point_lookup = {(int(round(y)), int(round(x))): np.array([y, x], dtype=float) for y, x in points_yx}
+    lines = []
+
+    for y in ys:
+        row = []
+        for x in xs:
+            row.append(point_lookup[(int(y), int(x))])
+        lines.append(np.asarray(row, dtype=float))
+
+    for x in xs:
+        col = []
+        for y in ys:
+            col.append(point_lookup[(int(y), int(x))])
+        lines.append(np.asarray(col, dtype=float))
+
+    return lines
+
+
+def points_yx_to_xy(points_yx):
+    """skimage transforms use x/y coordinates, while napari points are y/x."""
+    points_yx = np.asarray(points_yx, dtype=float)
+    return points_yx[:, [1, 0]]
+
+
+def warp_slice_with_points(slice_2d, src_yx, dst_yx, order):
+    """
+    Warp slice using manually moved control points.
+
+    src_yx = original control grid positions.
+    dst_yx = edited/moved control grid positions.
+
+    The transform maps src -> dst. skimage.warp needs inverse_map, so this
+    samples the original source image into the destination image.
+    """
+    src_xy = points_yx_to_xy(src_yx)
+    dst_xy = points_yx_to_xy(dst_yx)
+
+    tform = PiecewiseAffineTransform()
+    ok = tform.estimate(src_xy, dst_xy)
+    if not ok:
+        raise RuntimeError("Could not estimate piecewise affine transform. Try more grid points or less extreme deformation.")
+
+    warped = warp(
+        slice_2d,
+        inverse_map=tform.inverse,
+        output_shape=slice_2d.shape,
+        order=order,
+        preserve_range=True,
+        mode="edge",
+    )
+    return warped
 
 
 # -----------------------------
@@ -378,6 +491,8 @@ class ControlPanel(QWidget):
         self.match_loader = MatchLoader(viewer)
         self.match_handler = MatchHandler(viewer)
         self.current_affine = np.eye(4)
+        self.deformations = {}
+        self.grid_spacing = 100
         self._building_ui = True
 
         layout = QVBoxLayout()
@@ -468,6 +583,52 @@ class ControlPanel(QWidget):
 
         transform_group.setLayout(transform_layout)
         layout.addWidget(transform_group)
+
+        # Slice deformation group
+        deform_group = QGroupBox("Slice Grid Deformation")
+        deform_layout = QVBoxLayout()
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Grid spacing"))
+        self.grid_spacing_spin = QSpinBox()
+        self.grid_spacing_spin.setMinimum(10)
+        self.grid_spacing_spin.setMaximum(2000)
+        self.grid_spacing_spin.setValue(100)
+        self.grid_spacing_spin.valueChanged.connect(self.set_grid_spacing)
+        row.addWidget(self.grid_spacing_spin)
+        deform_layout.addLayout(row)
+
+        self.create_grid_button = QPushButton("Create Grid For Current Slice")
+        self.create_grid_button.clicked.connect(self.create_deformation_grid)
+        deform_layout.addWidget(self.create_grid_button)
+
+        self.update_grid_button = QPushButton("Update Grid Lines")
+        self.update_grid_button.clicked.connect(self.update_deformation_grid_lines)
+        deform_layout.addWidget(self.update_grid_button)
+
+        self.apply_deform_button = QPushButton("Apply Deformation To Current Slice")
+        self.apply_deform_button.clicked.connect(self.apply_deformation_current_slice)
+        deform_layout.addWidget(self.apply_deform_button)
+
+        self.save_deform_button = QPushButton("Save Current Slice Deformation")
+        self.save_deform_button.clicked.connect(self.save_current_slice_deformation)
+        deform_layout.addWidget(self.save_deform_button)
+
+        self.load_deform_button = QPushButton("Load Deformation JSON")
+        self.load_deform_button.clicked.connect(self.load_deformation_json)
+        deform_layout.addWidget(self.load_deform_button)
+
+        self.apply_saved_deform_button = QPushButton("Apply Saved Deformation To Current Slice")
+        self.apply_saved_deform_button.clicked.connect(self.apply_saved_deformation_current_slice)
+        deform_layout.addWidget(self.apply_saved_deform_button)
+
+        self.save_all_deform_button = QPushButton("Save All Deformations JSON")
+        self.save_all_deform_button.clicked.connect(self.save_all_deformations_json)
+        deform_layout.addWidget(self.save_all_deform_button)
+
+        deform_layout.addWidget(QLabel("Edit only the Destination Points layer. Source Points stays fixed."))
+        deform_group.setLayout(deform_layout)
+        layout.addWidget(deform_group)
 
         # Save group
         save_group = QGroupBox("Save Layers")
@@ -683,6 +844,206 @@ class ControlPanel(QWidget):
             "sx": 1.0, "sy": 1.0, "sz": 1.0,
         })
         self.update_affine_transformation()
+
+
+    def set_grid_spacing(self):
+        self.grid_spacing = int(self.grid_spacing_spin.value())
+
+    def get_deformation_target_shape(self):
+        if INVITRO_IMAGE in self.viewer.layers:
+            z = current_z_index(self.viewer)
+            return get_layer_slice_2d(self.viewer.layers[INVITRO_IMAGE], z).shape
+        if INVITRO_MASK in self.viewer.layers:
+            z = current_z_index(self.viewer)
+            return get_layer_slice_2d(self.viewer.layers[INVITRO_MASK], z).shape
+        raise RuntimeError("Load an in-vitro image or mask before creating a deformation grid.")
+
+    def create_deformation_grid(self):
+        try:
+            shape = self.get_deformation_target_shape()
+        except RuntimeError as e:
+            QMessageBox.warning(self, "No In-vitro Layer", str(e))
+            return
+
+        spacing = int(self.grid_spacing_spin.value())
+        points, ys, xs = make_regular_grid_points(shape, spacing)
+
+        for name in [DEFORM_SRC_POINTS, DEFORM_DST_POINTS, DEFORM_GRID]:
+            if name in self.viewer.layers:
+                self.viewer.layers.remove(name)
+
+        self.viewer.add_points(
+            points,
+            name=DEFORM_SRC_POINTS,
+            size=6,
+            face_color="gray",
+            opacity=0.35,
+            ndim=2,
+        )
+        self.viewer.layers[DEFORM_SRC_POINTS].editable = False
+
+        self.viewer.add_points(
+            points.copy(),
+            name=DEFORM_DST_POINTS,
+            size=8,
+            face_color="red",
+            opacity=0.9,
+            ndim=2,
+        )
+
+        lines = make_grid_lines_from_points(points, ys, xs)
+        self.viewer.add_shapes(
+            lines,
+            shape_type="path",
+            name=DEFORM_GRID,
+            edge_width=1,
+            opacity=0.6,
+            ndim=2,
+        )
+
+        self._grid_ys = ys
+        self._grid_xs = xs
+        print(f"Created deformation grid for slice z={current_z_index(self.viewer)} with {len(points)} control points.")
+        print("Move points in the Deform Destination Points layer, then click Apply Deformation To Current Slice.")
+
+    def update_deformation_grid_lines(self):
+        if DEFORM_DST_POINTS not in self.viewer.layers:
+            QMessageBox.warning(self, "Missing Points", "Create a deformation grid first.")
+            return
+
+        dst = np.asarray(self.viewer.layers[DEFORM_DST_POINTS].data, dtype=float)
+        if not hasattr(self, "_grid_ys") or not hasattr(self, "_grid_xs"):
+            # Reconstruct a best-effort grid layout from source points.
+            src = np.asarray(self.viewer.layers[DEFORM_SRC_POINTS].data, dtype=float)
+            self._grid_ys = sorted(set(int(round(y)) for y in src[:, 0]))
+            self._grid_xs = sorted(set(int(round(x)) for x in src[:, 1]))
+
+        lines = []
+        ny = len(self._grid_ys)
+        nx = len(self._grid_xs)
+        if len(dst) != ny * nx:
+            QMessageBox.warning(self, "Grid Changed", "Do not add/delete grid points. Move existing destination points only.")
+            return
+
+        grid = dst.reshape(ny, nx, 2)
+        for i in range(ny):
+            lines.append(grid[i, :, :])
+        for j in range(nx):
+            lines.append(grid[:, j, :])
+
+        if DEFORM_GRID in self.viewer.layers:
+            self.viewer.layers[DEFORM_GRID].data = lines
+            self.viewer.layers[DEFORM_GRID].refresh()
+        else:
+            self.viewer.add_shapes(lines, shape_type="path", name=DEFORM_GRID, edge_width=1, opacity=0.6, ndim=2)
+
+    def get_current_deformation_points(self):
+        if DEFORM_SRC_POINTS not in self.viewer.layers or DEFORM_DST_POINTS not in self.viewer.layers:
+            raise RuntimeError("Create a deformation grid first.")
+
+        src = np.asarray(self.viewer.layers[DEFORM_SRC_POINTS].data, dtype=float)
+        dst = np.asarray(self.viewer.layers[DEFORM_DST_POINTS].data, dtype=float)
+        if src.shape != dst.shape or src.shape[0] < 3:
+            raise RuntimeError("Source and destination points must have the same shape and at least 3 points.")
+        return src, dst
+
+    def apply_deformation_current_slice(self):
+        try:
+            src, dst = self.get_current_deformation_points()
+        except RuntimeError as e:
+            QMessageBox.warning(self, "No Deformation Grid", str(e))
+            return
+
+        z = current_z_index(self.viewer)
+        self.apply_deformation_points_to_slice(z, src, dst)
+        self.save_current_slice_deformation(silent=True)
+        self.update_deformation_grid_lines()
+        print(f"Applied grid deformation to in-vitro slice z={z}.")
+
+    def apply_deformation_points_to_slice(self, z, src, dst):
+        # Image uses linear interpolation.
+        if INVITRO_IMAGE in self.viewer.layers:
+            image_layer = self.viewer.layers[INVITRO_IMAGE]
+            image_slice = get_layer_slice_2d(image_layer, z)
+            warped_image = warp_slice_with_points(image_slice, src, dst, order=1)
+            set_layer_slice_2d(image_layer, z, warped_image)
+            image_layer.refresh()
+            print(f"Def Applied grid deformation to in-vitro slice z={z}.")
+
+        # Mask and matches use nearest-neighbor interpolation to preserve labels.
+        for label_layer_name in [INVITRO_MASK, INVITRO_MATCHES]:
+            if label_layer_name in self.viewer.layers:
+                label_layer = self.viewer.layers[label_layer_name]
+                label_slice = get_layer_slice_2d(label_layer, z)
+                warped_label = warp_slice_with_points(label_slice, src, dst, order=0)
+                set_layer_slice_2d(label_layer, z, np.rint(warped_label).astype(label_layer.data.dtype, copy=False))
+                label_layer.refresh()
+
+    def save_current_slice_deformation(self, silent=False):
+        try:
+            src, dst = self.get_current_deformation_points()
+        except RuntimeError as e:
+            if not silent:
+                QMessageBox.warning(self, "No Deformation Grid", str(e))
+            return
+
+        z = current_z_index(self.viewer)
+        self.deformations[str(z)] = {
+            "src_points_yx": src.tolist(),
+            "dst_points_yx": dst.tolist(),
+            "grid_spacing": int(self.grid_spacing_spin.value()),
+        }
+        if not silent:
+            print(f"Saved deformation in memory for slice z={z}.")
+
+    def save_all_deformations_json(self):
+        self.save_current_slice_deformation(silent=True)
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Deformations", filter="JSON Files (*.json)")
+        if not save_path:
+            return
+        payload = {
+            "deformations": self.deformations,
+            "applies_to": [INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES],
+            "point_order": "yx napari coordinates",
+        }
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Saved deformations to {save_path}")
+
+    def load_deformation_json(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Deformation JSON", filter="JSON Files (*.json)")
+        if not file_path:
+            return
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        self.deformations = payload.get("deformations", payload)
+        print(f"Loaded deformations from {file_path}")
+
+    def apply_saved_deformation_current_slice(self):
+        z = current_z_index(self.viewer)
+        info = self.deformations.get(str(z))
+        if info is None:
+            QMessageBox.warning(self, "No Saved Deformation", f"No saved deformation found for slice z={z}.")
+            return
+
+        src = np.asarray(info["src_points_yx"], dtype=float)
+        dst = np.asarray(info["dst_points_yx"], dtype=float)
+        self.apply_deformation_points_to_slice(z, src, dst)
+
+        # Show the loaded deformation grid so it can be edited further.
+        for name in [DEFORM_SRC_POINTS, DEFORM_DST_POINTS, DEFORM_GRID]:
+            if name in self.viewer.layers:
+                self.viewer.layers.remove(name)
+        self.viewer.add_points(src, name=DEFORM_SRC_POINTS, size=6, face_color="gray", opacity=0.35, ndim=2)
+        self.viewer.layers[DEFORM_SRC_POINTS].editable = False
+        self.viewer.add_points(dst, name=DEFORM_DST_POINTS, size=8, face_color="red", opacity=0.9, ndim=2)
+
+        ys = sorted(set(int(round(y)) for y in src[:, 0]))
+        xs = sorted(set(int(round(x)) for x in src[:, 1]))
+        self._grid_ys = ys
+        self._grid_xs = xs
+        self.update_deformation_grid_lines()
+        print(f"Applied saved deformation for slice z={z}.")
 
     def save_layer(self, layer_name):
         if layer_name not in self.viewer.layers:

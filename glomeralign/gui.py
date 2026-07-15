@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QCheckBox,
     QInputDialog,
+    QTabWidget,
 )
 
 try:
@@ -217,13 +218,33 @@ def get_layer_slice_2d(layer, z):
 
 
 def set_layer_slice_2d(layer, z, slice_data):
+    """Assign a warped 2D slice back into a 2D/3D napari layer.
+
+    Important: after modifying a slice in-place, reassign layer.data to the
+    same array so napari emits a data-change event. layer.refresh() alone can
+    fail to visibly redraw for large arrays / cached rendering.
+    """
     data = layer.data
     if data.ndim == 2:
         layer.data = slice_data.astype(data.dtype, copy=False)
     else:
         z = min(max(int(z), 0), data.shape[0] - 1)
-        data[z] = slice_data.astype(data.dtype, copy=False)
-        layer.refresh()
+        data[z, ...] = slice_data.astype(data.dtype, copy=False)
+        layer.data = data
+    layer.refresh()
+
+
+def get_invitro_2d_scale(viewer):
+    """Return y/x scale for deformation points so they overlay image data."""
+    if INVITRO_IMAGE in viewer.layers:
+        scale = viewer.layers[INVITRO_IMAGE].scale
+    elif INVITRO_MASK in viewer.layers:
+        scale = viewer.layers[INVITRO_MASK].scale
+    else:
+        return (1.0, 1.0)
+    if len(scale) >= 2:
+        return tuple(scale[-2:])
+    return (1.0, 1.0)
 
 
 def make_regular_grid_points(shape_yx, spacing):
@@ -497,99 +518,144 @@ class ControlPanel(QWidget):
 
         layout = QVBoxLayout()
 
-        # Load group
-        load_group = QGroupBox("Load Data")
+        # Compact right sidebar. Tabs avoid one very long vertical control panel,
+        # but keep the same behavior as this version of the GUI.
+        tabs = QTabWidget()
+
+        # -------------------------
+        # Data / view / matching tab
+        # -------------------------
+        data_tab = QWidget()
+        data_layout = QVBoxLayout()
+
+        load_group = QGroupBox("Load")
         load_layout = QVBoxLayout()
 
-        self.load_invivo_image_button = QPushButton("Load In-vivo Image")
+        row = QHBoxLayout()
+        self.load_invivo_image_button = QPushButton("In-vivo Img")
         self.load_invivo_image_button.clicked.connect(lambda: self.load_image(INVIVO_IMAGE))
-        load_layout.addWidget(self.load_invivo_image_button)
+        row.addWidget(self.load_invivo_image_button)
 
-        self.load_invivo_mask_button = QPushButton("Load In-vivo Mask")
+        self.load_invivo_mask_button = QPushButton("In-vivo Mask")
         self.load_invivo_mask_button.clicked.connect(lambda: self.load_mask(INVIVO_MASK))
-        load_layout.addWidget(self.load_invivo_mask_button)
+        row.addWidget(self.load_invivo_mask_button)
+        load_layout.addLayout(row)
 
-        self.load_invitro_image_button = QPushButton("Load In-vitro Image")
+        row = QHBoxLayout()
+        self.load_invitro_image_button = QPushButton("In-vitro Img")
         self.load_invitro_image_button.clicked.connect(lambda: self.load_image(INVITRO_IMAGE))
-        load_layout.addWidget(self.load_invitro_image_button)
+        row.addWidget(self.load_invitro_image_button)
 
-        self.load_invitro_mask_button = QPushButton("Load In-vitro Mask")
+        self.load_invitro_mask_button = QPushButton("In-vitro Mask")
         self.load_invitro_mask_button.clicked.connect(lambda: self.load_mask(INVITRO_MASK))
-        load_layout.addWidget(self.load_invitro_mask_button)
+        row.addWidget(self.load_invitro_mask_button)
+        load_layout.addLayout(row)
 
-        self.load_from_config_button = QPushButton("Load Images From Config")
+        row = QHBoxLayout()
+        self.load_from_config_button = QPushButton("Cfg Images")
         self.load_from_config_button.clicked.connect(self.load_images_from_config)
-        load_layout.addWidget(self.load_from_config_button)
+        row.addWidget(self.load_from_config_button)
 
-        self.load_masks_from_config_button = QPushButton("Load Masks From Config")
+        self.load_masks_from_config_button = QPushButton("Cfg Masks")
         self.load_masks_from_config_button.clicked.connect(self.load_masks_from_config)
-        load_layout.addWidget(self.load_masks_from_config_button)
+        row.addWidget(self.load_masks_from_config_button)
+        load_layout.addLayout(row)
 
         load_group.setLayout(load_layout)
-        layout.addWidget(load_group)
+        data_layout.addWidget(load_group)
 
-        # View group
         view_group = QGroupBox("View")
-        view_layout = QVBoxLayout()
+        view_layout = QHBoxLayout()
         self.ndisplay_checkbox = QCheckBox("3D display")
         self.ndisplay_checkbox.setChecked(False)
         self.ndisplay_checkbox.stateChanged.connect(self.toggle_3d)
         view_layout.addWidget(self.ndisplay_checkbox)
         view_group.setLayout(view_layout)
-        layout.addWidget(view_group)
+        data_layout.addWidget(view_group)
 
-        # Match group
         match_group = QGroupBox("Matching")
         match_layout = QVBoxLayout()
-        self.load_matches_button = QPushButton("Load / Initialize Matches")
+        row = QHBoxLayout()
+        self.load_matches_button = QPushButton("Load/Init")
         self.load_matches_button.clicked.connect(self.match_loader.load_matches)
-        match_layout.addWidget(self.load_matches_button)
+        row.addWidget(self.load_matches_button)
 
-        self.save_matches_button = QPushButton("Save Matches")
+        self.save_matches_button = QPushButton("Save")
         self.save_matches_button.clicked.connect(self.save_matches)
-        match_layout.addWidget(self.save_matches_button)
-
-        match_layout.addWidget(QLabel("Select a mask layer and press h to pick labels. Press z to undo."))
+        row.addWidget(self.save_matches_button)
+        match_layout.addLayout(row)
+        match_layout.addWidget(QLabel("Select mask layer. h = pick, z = undo."))
         match_group.setLayout(match_layout)
-        layout.addWidget(match_group)
+        data_layout.addWidget(match_group)
 
-        # Transform group
-        transform_group = QGroupBox("Transform In-vitro Image/Mask")
+        save_group = QGroupBox("Save")
+        save_layout = QVBoxLayout()
+        row = QHBoxLayout()
+        self.save_invivo_mask_button = QPushButton("In-vivo Mask")
+        self.save_invivo_mask_button.clicked.connect(lambda: self.save_layer(INVIVO_MASK))
+        row.addWidget(self.save_invivo_mask_button)
+
+        self.save_invitro_mask_button = QPushButton("In-vitro Mask")
+        self.save_invitro_mask_button.clicked.connect(lambda: self.save_layer(INVITRO_MASK))
+        row.addWidget(self.save_invitro_mask_button)
+        save_layout.addLayout(row)
+
+        self.save_selected_button = QPushButton("Selected Layer")
+        self.save_selected_button.clicked.connect(self.save_selected_layer)
+        save_layout.addWidget(self.save_selected_button)
+        save_group.setLayout(save_layout)
+        data_layout.addWidget(save_group)
+
+        data_layout.addStretch(1)
+        data_tab.setLayout(data_layout)
+        tabs.addTab(data_tab, "Data")
+
+        # -------------------------
+        # Transform tab
+        # -------------------------
+        transform_tab = QWidget()
         transform_layout = QVBoxLayout()
 
-        self.tx_slider, self.tx_spin = self.make_slider_spin("Translate X", -5000, 5000, 0, transform_layout)
-        self.ty_slider, self.ty_spin = self.make_slider_spin("Translate Y", -5000, 5000, 0, transform_layout)
-        self.tz_slider, self.tz_spin = self.make_slider_spin("Translate Z", -5000, 5000, 0, transform_layout)
+        self.tx_slider, self.tx_spin = self.make_slider_spin("Tx", -5000, 5000, 0, transform_layout)
+        self.ty_slider, self.ty_spin = self.make_slider_spin("Ty", -5000, 5000, 0, transform_layout)
+        self.tz_slider, self.tz_spin = self.make_slider_spin("Tz", -5000, 5000, 0, transform_layout)
 
-        self.rx_slider, self.rx_spin = self.make_slider_spin("Rotate X", -180, 180, 0, transform_layout)
-        self.ry_slider, self.ry_spin = self.make_slider_spin("Rotate Y", -180, 180, 0, transform_layout)
-        self.rz_slider, self.rz_spin = self.make_slider_spin("Rotate Z", -180, 180, 0, transform_layout)
+        self.rx_slider, self.rx_spin = self.make_slider_spin("Rx", -180, 180, 0, transform_layout)
+        self.ry_slider, self.ry_spin = self.make_slider_spin("Ry", -180, 180, 0, transform_layout)
+        self.rz_slider, self.rz_spin = self.make_slider_spin("Rz", -180, 180, 0, transform_layout)
 
-        self.sx_spin = self.make_double_spin("Scale X", 0.01, 20.0, 1.0, transform_layout)
-        self.sy_spin = self.make_double_spin("Scale Y", 0.01, 20.0, 1.0, transform_layout)
-        self.sz_spin = self.make_double_spin("Scale Z", 0.01, 20.0, 1.0, transform_layout)
+        scale_row = QHBoxLayout()
+        self.sx_spin = self.make_double_spin_inline("Sx", 0.01, 20.0, 1.0, scale_row)
+        self.sy_spin = self.make_double_spin_inline("Sy", 0.01, 20.0, 1.0, scale_row)
+        self.sz_spin = self.make_double_spin_inline("Sz", 0.01, 20.0, 1.0, scale_row)
+        transform_layout.addLayout(scale_row)
 
-        self.apply_saved_button = QPushButton("Apply Saved Transform")
+        row = QHBoxLayout()
+        self.apply_saved_button = QPushButton("Apply Saved")
         self.apply_saved_button.clicked.connect(self.apply_saved_transform)
-        transform_layout.addWidget(self.apply_saved_button)
+        row.addWidget(self.apply_saved_button)
 
-        self.save_transform_button = QPushButton("Save Transform")
+        self.save_transform_button = QPushButton("Save")
         self.save_transform_button.clicked.connect(self.save_transform)
-        transform_layout.addWidget(self.save_transform_button)
+        row.addWidget(self.save_transform_button)
+        transform_layout.addLayout(row)
 
-        self.reset_transform_button = QPushButton("Reset Transform Controls")
+        self.reset_transform_button = QPushButton("Reset Controls")
         self.reset_transform_button.clicked.connect(self.reset_transform_controls)
         transform_layout.addWidget(self.reset_transform_button)
 
-        transform_group.setLayout(transform_layout)
-        layout.addWidget(transform_group)
+        transform_layout.addStretch(1)
+        transform_tab.setLayout(transform_layout)
+        tabs.addTab(transform_tab, "Transform")
 
-        # Slice deformation group
-        deform_group = QGroupBox("Slice Grid Deformation")
+        # -------------------------
+        # Deformation tab
+        # -------------------------
+        deform_tab = QWidget()
         deform_layout = QVBoxLayout()
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Grid spacing"))
+        row.addWidget(QLabel("Grid"))
         self.grid_spacing_spin = QSpinBox()
         self.grid_spacing_spin.setMinimum(10)
         self.grid_spacing_spin.setMaximum(2000)
@@ -598,55 +664,55 @@ class ControlPanel(QWidget):
         row.addWidget(self.grid_spacing_spin)
         deform_layout.addLayout(row)
 
-        self.create_grid_button = QPushButton("Create Grid For Current Slice")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Target in-vitro Z"))
+        self.target_z_spin = QSpinBox()
+        self.target_z_spin.setMinimum(0)
+        self.target_z_spin.setMaximum(9999)
+        self.target_z_spin.setValue(0)
+        row.addWidget(self.target_z_spin)
+        deform_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        self.create_grid_button = QPushButton("Create Grid")
         self.create_grid_button.clicked.connect(self.create_deformation_grid)
-        deform_layout.addWidget(self.create_grid_button)
+        row.addWidget(self.create_grid_button)
 
-        self.update_grid_button = QPushButton("Update Grid Lines")
+        self.update_grid_button = QPushButton("Update Lines")
         self.update_grid_button.clicked.connect(self.update_deformation_grid_lines)
-        deform_layout.addWidget(self.update_grid_button)
+        row.addWidget(self.update_grid_button)
+        deform_layout.addLayout(row)
 
-        self.apply_deform_button = QPushButton("Apply Deformation To Current Slice")
+        row = QHBoxLayout()
+        self.apply_deform_button = QPushButton("Apply")
         self.apply_deform_button.clicked.connect(self.apply_deformation_current_slice)
-        deform_layout.addWidget(self.apply_deform_button)
+        row.addWidget(self.apply_deform_button)
 
-        self.save_deform_button = QPushButton("Save Current Slice Deformation")
+        self.save_deform_button = QPushButton("Save Slice")
         self.save_deform_button.clicked.connect(self.save_current_slice_deformation)
-        deform_layout.addWidget(self.save_deform_button)
+        row.addWidget(self.save_deform_button)
+        deform_layout.addLayout(row)
 
-        self.load_deform_button = QPushButton("Load Deformation JSON")
-        self.load_deform_button.clicked.connect(self.load_deformation_json)
-        deform_layout.addWidget(self.load_deform_button)
-
-        self.apply_saved_deform_button = QPushButton("Apply Saved Deformation To Current Slice")
+        row = QHBoxLayout()
+        self.apply_saved_deform_button = QPushButton("Apply Saved")
         self.apply_saved_deform_button.clicked.connect(self.apply_saved_deformation_current_slice)
-        deform_layout.addWidget(self.apply_saved_deform_button)
+        row.addWidget(self.apply_saved_deform_button)
 
-        self.save_all_deform_button = QPushButton("Save All Deformations JSON")
+        self.load_deform_button = QPushButton("Load JSON")
+        self.load_deform_button.clicked.connect(self.load_deformation_json)
+        row.addWidget(self.load_deform_button)
+        deform_layout.addLayout(row)
+
+        self.save_all_deform_button = QPushButton("Save JSON")
         self.save_all_deform_button.clicked.connect(self.save_all_deformations_json)
         deform_layout.addWidget(self.save_all_deform_button)
 
-        deform_layout.addWidget(QLabel("Edit only the Destination Points layer. Source Points stays fixed."))
-        deform_group.setLayout(deform_layout)
-        layout.addWidget(deform_group)
+        deform_layout.addWidget(QLabel("Edit only red Destination Points. Source Points stays fixed."))
+        deform_layout.addStretch(1)
+        deform_tab.setLayout(deform_layout)
+        tabs.addTab(deform_tab, "Deform")
 
-        # Save group
-        save_group = QGroupBox("Save Layers")
-        save_layout = QVBoxLayout()
-        self.save_invivo_mask_button = QPushButton("Save In-vivo Mask")
-        self.save_invivo_mask_button.clicked.connect(lambda: self.save_layer(INVIVO_MASK))
-        save_layout.addWidget(self.save_invivo_mask_button)
-
-        self.save_invitro_mask_button = QPushButton("Save In-vitro Mask")
-        self.save_invitro_mask_button.clicked.connect(lambda: self.save_layer(INVITRO_MASK))
-        save_layout.addWidget(self.save_invitro_mask_button)
-
-        self.save_selected_button = QPushButton("Save Selected Layer")
-        self.save_selected_button.clicked.connect(self.save_selected_layer)
-        save_layout.addWidget(self.save_selected_button)
-        save_group.setLayout(save_layout)
-        layout.addWidget(save_group)
-
+        layout.addWidget(tabs)
         self.setLayout(layout)
         self._building_ui = False
 
@@ -654,8 +720,9 @@ class ControlPanel(QWidget):
             print("magicgui is available, but this single-viewer version uses Qt widgets for direct slider control.")
 
     def make_slider_spin(self, label, min_val, max_val, default, parent_layout):
-        parent_layout.addWidget(QLabel(label))
         row = QHBoxLayout()
+        row.addWidget(QLabel(label))
+
         slider = QSlider(Qt.Horizontal)
         slider.setMinimum(min_val)
         slider.setMaximum(max_val)
@@ -667,30 +734,35 @@ class ControlPanel(QWidget):
         spin.setMinimum(min_val)
         spin.setMaximum(max_val)
         spin.setValue(default)
-        spin.setSingleStep(10)
-        
+        spin.setFixedWidth(70)
+
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
         slider.valueChanged.connect(self.update_affine_transformation)
         spin.valueChanged.connect(self.update_affine_transformation)
 
-        row.addWidget(slider)
+        row.addWidget(slider, 1)
         row.addWidget(spin)
         parent_layout.addLayout(row)
         return slider, spin
 
     def make_double_spin(self, label, min_val, max_val, default, parent_layout):
         row = QHBoxLayout()
-        row.addWidget(QLabel(label))
+        spin = self.make_double_spin_inline(label, min_val, max_val, default, row)
+        parent_layout.addLayout(row)
+        return spin
+
+    def make_double_spin_inline(self, label, min_val, max_val, default, parent_layout):
+        parent_layout.addWidget(QLabel(label))
         spin = QDoubleSpinBox()
         spin.setMinimum(min_val)
         spin.setMaximum(max_val)
         spin.setSingleStep(0.01)
         spin.setDecimals(3)
         spin.setValue(default)
+        spin.setFixedWidth(70)
         spin.valueChanged.connect(self.update_affine_transformation)
-        row.addWidget(spin)
-        parent_layout.addLayout(row)
+        parent_layout.addWidget(spin)
         return spin
 
     def toggle_3d(self):
@@ -702,6 +774,7 @@ class ControlPanel(QWidget):
             return
         data = read_tiff(file_path)
         add_or_replace_image(self.viewer, data, layer_name, opacity=0.65 if "vitro" in layer_name else 1.0)
+        self.update_target_z_range()
         print(f"Loaded {layer_name}: {file_path}")
 
     def load_mask(self, layer_name):
@@ -710,6 +783,7 @@ class ControlPanel(QWidget):
             return
         data = read_tiff(file_path)
         add_or_replace_labels(self.viewer, data, layer_name, opacity=0.35)
+        self.update_target_z_range()
         print(f"Loaded {layer_name}: {file_path}")
 
     def load_images_from_config(self):
@@ -725,6 +799,7 @@ class ControlPanel(QWidget):
                 print(f"Loaded {layer_name} from config: {path}")
             else:
                 print(f"No valid config path for {layer_name}: {path}")
+        self.update_target_z_range()
 
     def load_masks_from_config(self):
         models = CONFIG.get("models", {}) if CONFIG else {}
@@ -740,6 +815,7 @@ class ControlPanel(QWidget):
                 print(f"Loaded {layer_name} from config: {path}")
             else:
                 print(f"No valid config path for {layer_name}: {path}")
+        self.update_target_z_range()
 
     def get_transform_values(self):
         return {
@@ -786,6 +862,11 @@ class ControlPanel(QWidget):
             if layer_name in self.viewer.layers:
                 self.viewer.layers[layer_name].affine = affine
                 self.viewer.layers[layer_name].refresh()
+
+        # If a deformation grid is visible, keep it visually aligned with
+        # the translated in-vitro slice. The grid stores raw coordinates
+        # internally and only shifts the overlay display.
+        self.refresh_deformation_grid_offset()
 
     def apply_saved_transform(self):
         global TRANSFORM_CONFIG
@@ -850,12 +931,108 @@ class ControlPanel(QWidget):
     def set_grid_spacing(self):
         self.grid_spacing = int(self.grid_spacing_spin.value())
 
+    def update_target_z_range(self):
+        if not hasattr(self, "target_z_spin"):
+            return
+        max_z = 0
+        for layer_name in [INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES]:
+            if layer_name in self.viewer.layers:
+                data = self.viewer.layers[layer_name].data
+                if getattr(data, "ndim", 0) >= 3:
+                    max_z = max(max_z, int(data.shape[0]) - 1)
+        old_value = self.target_z_spin.value()
+        self.target_z_spin.setMaximum(max_z)
+        self.target_z_spin.setValue(min(old_value, max_z))
+
+    def get_target_invitro_z(self):
+        self.update_target_z_range()
+        if hasattr(self, "target_z_spin"):
+            return int(self.target_z_spin.value())
+        return current_z_index(self.viewer)
+
+    def get_layer_affine_matrix(self, layer):
+        try:
+            return np.asarray(layer.affine.affine_matrix, dtype=float).copy()
+        except AttributeError:
+            return np.asarray(layer.affine, dtype=float).copy()
+
+    def get_grid_display_offset_yx(self):
+        """Return the y/x display offset, in point-layer data coordinates.
+
+        The deformation grid is drawn as a 2D overlay without the in-vitro affine.
+        To make it visually follow the translated in-vitro slice, shift the grid
+        by the current transform's Y/X translation. The warp itself still uses
+        raw in-vitro slice coordinates, so this offset is removed again before
+        applying the deformation.
+        """
+        try:
+            vals = self.get_transform_values()
+            ty = float(vals.get("ty", 0.0))
+            tx = float(vals.get("tx", 0.0))
+        except Exception:
+            ty = tx = 0.0
+
+        sy, sx = get_invitro_2d_scale(self.viewer)
+        sy = float(sy) if sy else 1.0
+        sx = float(sx) if sx else 1.0
+        return np.array([ty / sy, tx / sx], dtype=float)
+
+    def raw_points_to_display_points(self, points_yx):
+        return np.asarray(points_yx, dtype=float) + self.get_grid_display_offset_yx()
+
+    def display_points_to_raw_points(self, points_yx):
+        return np.asarray(points_yx, dtype=float) - self.get_grid_display_offset_yx()
+
+    def refresh_deformation_grid_offset(self):
+        """Move the source/destination/grid overlay to follow current X/Y translation.
+
+        This keeps the visual grid aligned with the translated in-vitro slice
+        without changing the saved raw deformation coordinates.
+        """
+        if not hasattr(self, "_grid_src_raw") or not hasattr(self, "_grid_dst_raw"):
+            return
+
+        src_display = self.raw_points_to_display_points(self._grid_src_raw)
+        dst_display = self.raw_points_to_display_points(self._grid_dst_raw)
+
+        if DEFORM_SRC_POINTS in self.viewer.layers:
+            self.viewer.layers[DEFORM_SRC_POINTS].data = src_display
+            self.viewer.layers[DEFORM_SRC_POINTS].refresh()
+        if DEFORM_DST_POINTS in self.viewer.layers:
+            self.viewer.layers[DEFORM_DST_POINTS].data = dst_display
+            self.viewer.layers[DEFORM_DST_POINTS].refresh()
+        self.update_deformation_grid_lines()
+
+    def apply_deformation_with_temporary_untransform(self, z, src, dst):
+        """Deform raw in-vitro slice z while preserving the visible affine transform.
+
+        This automates the manual workflow:
+        save affine -> set identity affine -> edit raw data slice -> restore affine.
+        """
+        layer_names = [INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES]
+        saved_affines = {}
+        try:
+            for layer_name in layer_names:
+                if layer_name in self.viewer.layers:
+                    layer = self.viewer.layers[layer_name]
+                    saved_affines[layer_name] = self.get_layer_affine_matrix(layer)
+                    layer.affine = np.eye(4)
+                    layer.refresh()
+
+            self.apply_deformation_points_to_slice(z, src, dst)
+
+        finally:
+            for layer_name, affine in saved_affines.items():
+                if layer_name in self.viewer.layers:
+                    layer = self.viewer.layers[layer_name]
+                    layer.affine = affine
+                    layer.refresh()
+
     def get_deformation_target_shape(self):
+        z = self.get_target_invitro_z()
         if INVITRO_IMAGE in self.viewer.layers:
-            z = current_z_index(self.viewer)
             return get_layer_slice_2d(self.viewer.layers[INVITRO_IMAGE], z).shape
         if INVITRO_MASK in self.viewer.layers:
-            z = current_z_index(self.viewer)
             return get_layer_slice_2d(self.viewer.layers[INVITRO_MASK], z).shape
         raise RuntimeError("Load an in-vitro image or mask before creating a deformation grid.")
 
@@ -867,32 +1044,40 @@ class ControlPanel(QWidget):
             return
 
         spacing = int(self.grid_spacing_spin.value())
-        points, ys, xs = make_regular_grid_points(shape, spacing)
+        points_raw, ys, xs = make_regular_grid_points(shape, spacing)
+        points_display = self.raw_points_to_display_points(points_raw)
 
         for name in [DEFORM_SRC_POINTS, DEFORM_DST_POINTS, DEFORM_GRID]:
             if name in self.viewer.layers:
                 self.viewer.layers.remove(name)
 
+        point_scale = get_invitro_2d_scale(self.viewer)
+
+        self._grid_src_raw = points_raw.copy()
+        self._grid_dst_raw = points_raw.copy()
+
         self.viewer.add_points(
-            points,
+            points_display,
             name=DEFORM_SRC_POINTS,
             size=6,
             face_color="gray",
             opacity=0.35,
             ndim=2,
+            scale=point_scale,
         )
         self.viewer.layers[DEFORM_SRC_POINTS].editable = False
 
         self.viewer.add_points(
-            points.copy(),
+            points_display.copy(),
             name=DEFORM_DST_POINTS,
             size=8,
             face_color="red",
             opacity=0.9,
             ndim=2,
+            scale=point_scale,
         )
 
-        lines = make_grid_lines_from_points(points, ys, xs)
+        lines = make_grid_lines_from_points(points_display, ys, xs)
         self.viewer.add_shapes(
             lines,
             shape_type="path",
@@ -900,22 +1085,31 @@ class ControlPanel(QWidget):
             edge_width=1,
             opacity=0.6,
             ndim=2,
+            scale=point_scale,
         )
 
         self._grid_ys = ys
         self._grid_xs = xs
-        print(f"Created deformation grid for slice z={current_z_index(self.viewer)} with {len(points)} control points.")
-        print("Move points in the Deform Destination Points layer, then click Apply Deformation To Current Slice.")
+        print(
+            f"Created deformation grid on the current display plane. "
+            f"It will deform raw in-vitro slice z={self.get_target_invitro_z()} with {len(points_raw)} control points."
+        )
+        print("Move points in the Deform Destination Points layer, then click Apply.")
 
     def update_deformation_grid_lines(self):
         if DEFORM_DST_POINTS not in self.viewer.layers:
             QMessageBox.warning(self, "Missing Points", "Create a deformation grid first.")
             return
 
-        dst = np.asarray(self.viewer.layers[DEFORM_DST_POINTS].data, dtype=float)
+        dst_display = np.asarray(self.viewer.layers[DEFORM_DST_POINTS].data, dtype=float)
+        # Keep an internal raw-coordinate copy of the moved destination points.
+        # This removes the visual X/Y translation offset before warping.
+        self._grid_dst_raw = self.display_points_to_raw_points(dst_display)
+        dst = dst_display
         if not hasattr(self, "_grid_ys") or not hasattr(self, "_grid_xs"):
             # Reconstruct a best-effort grid layout from source points.
-            src = np.asarray(self.viewer.layers[DEFORM_SRC_POINTS].data, dtype=float)
+            src_display = np.asarray(self.viewer.layers[DEFORM_SRC_POINTS].data, dtype=float)
+            src = self.display_points_to_raw_points(src_display)
             self._grid_ys = sorted(set(int(round(y)) for y in src[:, 0]))
             self._grid_xs = sorted(set(int(round(x)) for x in src[:, 1]))
 
@@ -936,14 +1130,23 @@ class ControlPanel(QWidget):
             self.viewer.layers[DEFORM_GRID].data = lines
             self.viewer.layers[DEFORM_GRID].refresh()
         else:
-            self.viewer.add_shapes(lines, shape_type="path", name=DEFORM_GRID, edge_width=1, opacity=0.6, ndim=2)
+            self.viewer.add_shapes(lines, shape_type="path", name=DEFORM_GRID, edge_width=1, opacity=0.6, ndim=2, scale=get_invitro_2d_scale(self.viewer))
 
     def get_current_deformation_points(self):
         if DEFORM_SRC_POINTS not in self.viewer.layers or DEFORM_DST_POINTS not in self.viewer.layers:
             raise RuntimeError("Create a deformation grid first.")
 
-        src = np.asarray(self.viewer.layers[DEFORM_SRC_POINTS].data, dtype=float)
-        dst = np.asarray(self.viewer.layers[DEFORM_DST_POINTS].data, dtype=float)
+        src_display = np.asarray(self.viewer.layers[DEFORM_SRC_POINTS].data, dtype=float)
+        dst_display = np.asarray(self.viewer.layers[DEFORM_DST_POINTS].data, dtype=float)
+
+        src = self.display_points_to_raw_points(src_display)
+        dst = self.display_points_to_raw_points(dst_display)
+
+        # Store raw copies so later translation changes can move the overlay
+        # without changing the actual deformation.
+        self._grid_src_raw = src.copy()
+        self._grid_dst_raw = dst.copy()
+
         if src.shape != dst.shape or src.shape[0] < 3:
             raise RuntimeError("Source and destination points must have the same shape and at least 3 points.")
         return src, dst
@@ -955,11 +1158,23 @@ class ControlPanel(QWidget):
             QMessageBox.warning(self, "No Deformation Grid", str(e))
             return
 
-        z = current_z_index(self.viewer)
-        self.apply_deformation_points_to_slice(z, src, dst)
+        max_disp = float(np.max(np.linalg.norm(dst - src, axis=1)))
+        if max_disp < 0.5:
+            QMessageBox.information(
+                self,
+                "No Visible Deformation",
+                "The destination points are almost identical to the source points. Move the red points farther before applying.",
+            )
+            return
+
+        z = self.get_target_invitro_z()
+        self.apply_deformation_with_temporary_untransform(z, src, dst)
         self.save_current_slice_deformation(silent=True)
         self.update_deformation_grid_lines()
-        print(f"Applied grid deformation to in-vitro slice z={z}.")
+        print(
+            f"Applied grid deformation to raw in-vitro slice z={z}, "
+            f"then restored the current affine transform. Max point displacement: {max_disp:.2f} pixels."
+        )
 
     def apply_deformation_points_to_slice(self, z, src, dst):
         # Image uses linear interpolation.
@@ -969,7 +1184,6 @@ class ControlPanel(QWidget):
             warped_image = warp_slice_with_points(image_slice, src, dst, order=1)
             set_layer_slice_2d(image_layer, z, warped_image)
             image_layer.refresh()
-            print(f"Def Applied grid deformation to in-vitro slice z={z}.")
 
         # Mask and matches use nearest-neighbor interpolation to preserve labels.
         for label_layer_name in [INVITRO_MASK, INVITRO_MATCHES]:
@@ -988,7 +1202,7 @@ class ControlPanel(QWidget):
                 QMessageBox.warning(self, "No Deformation Grid", str(e))
             return
 
-        z = current_z_index(self.viewer)
+        z = self.get_target_invitro_z()
         self.deformations[str(z)] = {
             "src_points_yx": src.tolist(),
             "dst_points_yx": dst.tolist(),
@@ -1021,7 +1235,7 @@ class ControlPanel(QWidget):
         print(f"Loaded deformations from {file_path}")
 
     def apply_saved_deformation_current_slice(self):
-        z = current_z_index(self.viewer)
+        z = self.get_target_invitro_z()
         info = self.deformations.get(str(z))
         if info is None:
             QMessageBox.warning(self, "No Saved Deformation", f"No saved deformation found for slice z={z}.")
@@ -1029,15 +1243,21 @@ class ControlPanel(QWidget):
 
         src = np.asarray(info["src_points_yx"], dtype=float)
         dst = np.asarray(info["dst_points_yx"], dtype=float)
-        self.apply_deformation_points_to_slice(z, src, dst)
+        self.apply_deformation_with_temporary_untransform(z, src, dst)
 
         # Show the loaded deformation grid so it can be edited further.
         for name in [DEFORM_SRC_POINTS, DEFORM_DST_POINTS, DEFORM_GRID]:
             if name in self.viewer.layers:
                 self.viewer.layers.remove(name)
-        self.viewer.add_points(src, name=DEFORM_SRC_POINTS, size=6, face_color="gray", opacity=0.35, ndim=2)
+        self._grid_src_raw = src.copy()
+        self._grid_dst_raw = dst.copy()
+        src_display = self.raw_points_to_display_points(src)
+        dst_display = self.raw_points_to_display_points(dst)
+
+        point_scale = get_invitro_2d_scale(self.viewer)
+        self.viewer.add_points(src_display, name=DEFORM_SRC_POINTS, size=6, face_color="gray", opacity=0.35, ndim=2, scale=point_scale)
         self.viewer.layers[DEFORM_SRC_POINTS].editable = False
-        self.viewer.add_points(dst, name=DEFORM_DST_POINTS, size=8, face_color="red", opacity=0.9, ndim=2)
+        self.viewer.add_points(dst_display, name=DEFORM_DST_POINTS, size=8, face_color="red", opacity=0.9, ndim=2, scale=point_scale)
 
         ys = sorted(set(int(round(y)) for y in src[:, 0]))
         xs = sorted(set(int(round(x)) for x in src[:, 1]))

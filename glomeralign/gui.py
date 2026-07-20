@@ -14,7 +14,7 @@ import pandas as pd
 import yaml
 from tifffile import imread, imwrite
 from skimage.measure import regionprops_table
-from skimage.transform import PiecewiseAffineTransform, warp
+from skimage.transform import AffineTransform, PiecewiseAffineTransform, SimilarityTransform, warp
 
 import napari
 from PyQt5.QtCore import Qt
@@ -63,7 +63,10 @@ INVITRO_MATCHES = "In-vitro Matches"
 DEFORM_SRC_POINTS = "Deform Source Points"
 DEFORM_DST_POINTS = "Deform Destination Points"
 DEFORM_GRID = "Deform Grid"
+TRAKEM_SRC_POINTS = "Nonlinear Source Points"
+TRAKEM_DST_POINTS = "Nonlinear Destination Points"
 DEFORMATION_PATH = None
+MAX_DEFORMATION_GRID_POINTS = 2500
 
 
 # -----------------------------
@@ -247,9 +250,23 @@ def get_invitro_2d_scale(viewer):
     return (1.0, 1.0)
 
 
+def deformation_grid_shape(shape_yx, spacing):
+    """Return regular grid row/column counts without allocating its points."""
+    if len(shape_yx) != 2:
+        raise ValueError("A deformation grid requires a 2D (height, width) shape.")
+    height, width = (int(value) for value in shape_yx)
+    if height < 2 or width < 2:
+        raise ValueError("A deformation grid requires an image at least 2 x 2 pixels.")
+    spacing = max(int(spacing), 2)
+    ny = ((height - 2) // spacing) + 2
+    nx = ((width - 2) // spacing) + 2
+    return ny, nx
+
+
 def make_regular_grid_points(shape_yx, spacing):
     """Return points in napari 2D coordinates, y/x order."""
-    height, width = shape_yx
+    deformation_grid_shape(shape_yx, spacing)
+    height, width = (int(value) for value in shape_yx)
     spacing = max(int(spacing), 2)
 
     ys = list(range(0, height, spacing))
@@ -264,6 +281,19 @@ def make_regular_grid_points(shape_yx, spacing):
         for x in xs:
             points.append([float(y), float(x)])
     return np.asarray(points, dtype=float), ys, xs
+
+
+def minimum_grid_spacing(shape_yx, max_points=MAX_DEFORMATION_GRID_POINTS):
+    """Return the smallest spacing whose regular grid stays under max_points."""
+    if max_points < 4:
+        raise ValueError("A deformation grid needs room for at least four points.")
+    deformation_grid_shape(shape_yx, 2)
+    spacing = 2
+    while True:
+        ny, nx = deformation_grid_shape(shape_yx, spacing)
+        if ny * nx <= max_points:
+            return spacing
+        spacing += 1
 
 
 def make_grid_lines_from_points(points_yx, ys, xs):
@@ -292,6 +322,26 @@ def points_yx_to_xy(points_yx):
     return points_yx[:, [1, 0]]
 
 
+def validate_deformation_points(src_yx, dst_yx):
+    """Validate point arrays before handing them to scipy/Qhull via skimage."""
+    src = np.asarray(src_yx, dtype=float)
+    dst = np.asarray(dst_yx, dtype=float)
+    if src.ndim != 2 or src.shape[1:] != (2,):
+        raise RuntimeError("Deformation points must be an N x 2 array in y/x order.")
+    if src.shape != dst.shape:
+        raise RuntimeError("Source and destination points must have the same shape.")
+    if len(src) < 4:
+        raise RuntimeError("A deformation grid requires at least four control points.")
+    if not np.all(np.isfinite(src)) or not np.all(np.isfinite(dst)):
+        raise RuntimeError("Deformation points contain NaN or infinite coordinates.")
+    for name, points in (("Source", src), ("Destination", dst)):
+        if len(np.unique(points, axis=0)) < 3:
+            raise RuntimeError(f"{name} points contain too few unique positions.")
+        if np.linalg.matrix_rank(points - points.mean(axis=0)) < 2:
+            raise RuntimeError(f"{name} points are collinear and cannot define a 2D warp.")
+    return src, dst
+
+
 def warp_slice_with_points(slice_2d, src_yx, dst_yx, order):
     """
     Warp slice using manually moved control points.
@@ -302,11 +352,18 @@ def warp_slice_with_points(slice_2d, src_yx, dst_yx, order):
     The transform maps src -> dst. skimage.warp needs inverse_map, so this
     samples the original source image into the destination image.
     """
+    src_yx, dst_yx = validate_deformation_points(src_yx, dst_yx)
     src_xy = points_yx_to_xy(src_yx)
     dst_xy = points_yx_to_xy(dst_yx)
 
-    tform = PiecewiseAffineTransform()
-    ok = tform.estimate(src_xy, dst_xy)
+    try:
+        tform = PiecewiseAffineTransform()
+        ok = tform.estimate(src_xy, dst_xy)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not triangulate the deformation grid. Move overlapping or "
+            "crossed destination points closer to their source positions."
+        ) from exc
     if not ok:
         raise RuntimeError("Could not estimate piecewise affine transform. Try more grid points or less extreme deformation.")
 
@@ -319,6 +376,60 @@ def warp_slice_with_points(slice_2d, src_yx, dst_yx, order):
         mode="edge",
     )
     return warped
+
+
+def empty_points():
+    """Return an empty napari-compatible 2D point array."""
+    return np.empty((0, 2), dtype=float)
+
+
+def nonlinear_transform_for_points(src_yx, dst_yx, output_shape=None):
+    """Estimate model by landmark count: translation, similarity, affine, or local."""
+    src, dst = np.asarray(src_yx, float), np.asarray(dst_yx, float)
+    if src.ndim != 2 or src.shape[1:] != (2,) or src.shape != dst.shape:
+        raise RuntimeError("Control points must be matching N x 2 arrays in y/x order.")
+    if len(src) < 1:
+        raise RuntimeError("Add at least one nonlinear control point.")
+    if not np.all(np.isfinite(src)) or not np.all(np.isfinite(dst)):
+        raise RuntimeError("Control points contain NaN or infinite coordinates.")
+    src_xy, dst_xy = points_yx_to_xy(src), points_yx_to_xy(dst)
+    if len(src) == 1:
+        return SimilarityTransform(translation=dst_xy[0] - src_xy[0]), "translation"
+    if len(src) == 2:
+        if np.linalg.norm(src_xy[1] - src_xy[0]) < 1e-6:
+            raise RuntimeError("The two source points must be distinct.")
+        tform, model = SimilarityTransform(), "similarity"
+        ok = tform.estimate(src_xy, dst_xy)
+    elif len(src) == 3:
+        if np.linalg.matrix_rank(src - src.mean(axis=0)) < 2:
+            raise RuntimeError("Three points must not be collinear.")
+        tform, model = AffineTransform(), "affine"
+        ok = tform.estimate(src_xy, dst_xy)
+    else:
+        if output_shape is None:
+            raise RuntimeError("An output shape is required for a local transform.")
+        height, width = output_shape
+        boundary = np.asarray([[0, 0], [width-1, 0], [0, height-1], [width-1, height-1],
+            [(width-1)/2, 0], [(width-1)/2, height-1],
+            [0, (height-1)/2], [width-1, (height-1)/2]], float)
+        keep = np.min(np.linalg.norm(boundary[:, None] - src_xy[None], axis=2), axis=1) > 1e-6
+        boundary = boundary[keep]
+        src_xy, dst_xy = np.vstack([src_xy, boundary]), np.vstack([dst_xy, boundary])
+        tform, model = PiecewiseAffineTransform(), "piecewise affine"
+        try:
+            ok = tform.estimate(src_xy, dst_xy)
+        except Exception as exc:
+            raise RuntimeError("Could not triangulate the local transform; check for duplicate points.") from exc
+    if not ok:
+        raise RuntimeError(f"Could not estimate the {model} transform.")
+    return tform, model
+
+
+def warp_slice_trakem2(slice_2d, src_yx, dst_yx, order):
+    """Warp one slice using TrakEM2 landmark-count behavior."""
+    tform, _ = nonlinear_transform_for_points(src_yx, dst_yx, slice_2d.shape)
+    return warp(slice_2d, inverse_map=tform.inverse, output_shape=slice_2d.shape,
+                order=order, preserve_range=True, mode="edge")
 
 
 # -----------------------------
@@ -514,6 +625,7 @@ class ControlPanel(QWidget):
         self.current_affine = np.eye(4)
         self.deformations = {}
         self.grid_spacing = 100
+        self._nonlinear_mode = False
         self._building_ui = True
 
         layout = QVBoxLayout()
@@ -654,6 +766,36 @@ class ControlPanel(QWidget):
         deform_tab = QWidget()
         deform_layout = QVBoxLayout()
 
+        nonlinear_group = QGroupBox("TrakEM2-style sparse transform")
+        nonlinear_layout = QVBoxLayout()
+        self.start_nonlinear_button = QPushButton("Start Nonlinear (Shift+T)")
+        self.start_nonlinear_button.clicked.connect(self.start_nonlinear_transform)
+        nonlinear_layout.addWidget(self.start_nonlinear_button)
+
+        row = QHBoxLayout()
+        self.apply_nonlinear_button = QPushButton("Apply (Enter)")
+        self.apply_nonlinear_button.clicked.connect(self.apply_nonlinear_current)
+        row.addWidget(self.apply_nonlinear_button)
+        self.cancel_nonlinear_button = QPushButton("Cancel (Esc)")
+        self.cancel_nonlinear_button.clicked.connect(self.cancel_nonlinear_transform)
+        row.addWidget(self.cancel_nonlinear_button)
+        nonlinear_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        self.propagate_first_button = QPushButton("Apply to First")
+        self.propagate_first_button.clicked.connect(lambda: self.apply_nonlinear_transform("first"))
+        row.addWidget(self.propagate_first_button)
+        self.propagate_last_button = QPushButton("Apply to Last")
+        self.propagate_last_button.clicked.connect(lambda: self.apply_nonlinear_transform("last"))
+        row.addWidget(self.propagate_last_button)
+        nonlinear_layout.addLayout(row)
+        nonlinear_layout.addWidget(QLabel(
+            "Use + then click (or Shift+click); drag red points. "
+            "1=move, 2=similarity, 3=affine, 4+=local."
+        ))
+        nonlinear_group.setLayout(nonlinear_layout)
+        deform_layout.addWidget(nonlinear_group)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("Grid"))
         self.grid_spacing_spin = QSpinBox()
@@ -715,6 +857,11 @@ class ControlPanel(QWidget):
         layout.addWidget(tabs)
         self.setLayout(layout)
         self._building_ui = False
+
+        self.viewer.bind_key("Shift-T", self.start_nonlinear_transform, overwrite=True)
+        self.viewer.bind_key("Enter", self.apply_nonlinear_current, overwrite=True)
+        self.viewer.bind_key("Escape", self.cancel_nonlinear_transform, overwrite=True)
+        self.viewer.mouse_drag_callbacks.append(self._nonlinear_mouse_callback)
 
         if MAGICGUI_AVAILABLE:
             print("magicgui is available, but this single-viewer version uses Qt widgets for direct slider control.")
@@ -928,6 +1075,169 @@ class ControlPanel(QWidget):
         self.update_affine_transformation()
 
 
+    def _remove_nonlinear_layers(self):
+        for name in (TRAKEM_SRC_POINTS, TRAKEM_DST_POINTS):
+            if name in self.viewer.layers:
+                self.viewer.layers.remove(name)
+
+    def start_nonlinear_transform(self, _event=None):
+        if self.viewer.dims.ndisplay != 2:
+            QMessageBox.warning(self, "2D Mode Required", "Switch to 2D display before nonlinear editing.")
+            return
+        try:
+            self.get_deformation_target_shape()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "No In-vitro Layer", str(exc))
+            return
+        self._remove_nonlinear_layers()
+        scale = get_invitro_2d_scale(self.viewer)
+        empty = np.empty((0, 2), dtype=float)
+        self.viewer.add_points(empty, name=TRAKEM_SRC_POINTS, size=7, face_color="gray",
+                               opacity=0.45, ndim=2, scale=scale)
+        self.viewer.layers[TRAKEM_SRC_POINTS].editable = False
+        dst_layer = self.viewer.add_points(empty.copy(), name=TRAKEM_DST_POINTS, size=10,
+                                           face_color="red", opacity=0.95, ndim=2, scale=scale)
+        dst_layer.mode = "select"
+        self._nonlinear_last_dst = empty.copy()
+        self._syncing_nonlinear_points = False
+        dst_layer.events.data.connect(self._sync_nonlinear_point_pairs)
+        self._nonlinear_mode = True
+        print(
+            "Nonlinear mode: use the Points + tool and click to add landmarks "
+            "(Shift+click also works), then drag red points."
+        )
+
+    def _sync_nonlinear_point_pairs(self, _event=None):
+        """Keep immutable source landmarks paired with edits to destination points."""
+        if self._syncing_nonlinear_points:
+            return
+        if TRAKEM_SRC_POINTS not in self.viewer.layers or TRAKEM_DST_POINTS not in self.viewer.layers:
+            return
+        self._syncing_nonlinear_points = True
+        try:
+            src_layer = self.viewer.layers[TRAKEM_SRC_POINTS]
+            dst = np.asarray(self.viewer.layers[TRAKEM_DST_POINTS].data, dtype=float).reshape((-1, 2))
+            src = np.asarray(src_layer.data, dtype=float).reshape((-1, 2))
+            old_dst = np.asarray(getattr(self, "_nonlinear_last_dst", empty_points()), dtype=float).reshape((-1, 2))
+
+            if len(dst) > len(src):
+                # Napari appends points in add mode. Their initial destination
+                # positions are also their fixed source positions.
+                src = np.vstack([src, dst[len(src):]])
+                src_layer.data = src
+                src_layer.refresh()
+            elif len(dst) < len(src):
+                # Identify retained destination rows so deleting a red point
+                # removes its corresponding fixed source point as well.
+                retained = []
+                unused = list(range(len(old_dst)))
+                for point in dst:
+                    if not unused:
+                        break
+                    distances = [np.linalg.norm(old_dst[index] - point) for index in unused]
+                    retained.append(unused.pop(int(np.argmin(distances))))
+                src_layer.data = src[retained] if retained else np.empty((0, 2), dtype=float)
+                src_layer.refresh()
+            self._nonlinear_last_dst = dst.copy()
+        finally:
+            self._syncing_nonlinear_points = False
+
+    def _nonlinear_mouse_callback(self, viewer, event):
+        if not self._nonlinear_mode or event.type != "mouse_press":
+            return
+        modifiers = [str(value).lower() for value in getattr(event, "modifiers", ())]
+        if not any("shift" in value for value in modifiers):
+            return
+        target = next(
+            (viewer.layers[name] for name in (INVITRO_IMAGE, INVITRO_MASK) if name in viewer.layers),
+            None,
+        )
+        if target is None:
+            return
+        data_position = np.asarray(target.world_to_data(event.position), dtype=float)[-2:]
+        display_position = self.raw_points_to_display_points(data_position)[None, :]
+        layer = viewer.layers[TRAKEM_DST_POINTS]
+        old = np.asarray(layer.data, dtype=float).reshape((-1, 2))
+        layer.data = np.vstack([old, display_position])
+        layer.refresh()
+        self._sync_nonlinear_point_pairs()
+        viewer.layers.selection.active = layer
+        layer.mode = "select"
+        yield
+
+    def get_nonlinear_points(self):
+        if TRAKEM_SRC_POINTS not in self.viewer.layers or TRAKEM_DST_POINTS not in self.viewer.layers:
+            raise RuntimeError("Start nonlinear mode and add control points first.")
+        src = self.display_points_to_raw_points(self.viewer.layers[TRAKEM_SRC_POINTS].data)
+        dst = self.display_points_to_raw_points(self.viewer.layers[TRAKEM_DST_POINTS].data)
+        if src.shape != dst.shape:
+            raise RuntimeError(
+                "Source/destination points became unpaired. Cancel and restart nonlinear mode."
+            )
+        nonlinear_transform_for_points(src, dst, self.get_deformation_target_shape())
+        return src, dst
+
+    def _apply_nonlinear_points_to_slice(self, z, src, dst):
+        if INVITRO_IMAGE in self.viewer.layers:
+            layer = self.viewer.layers[INVITRO_IMAGE]
+            warped = warp_slice_trakem2(get_layer_slice_2d(layer, z), src, dst, order=1)
+            set_layer_slice_2d(layer, z, warped)
+        for name in (INVITRO_MASK, INVITRO_MATCHES):
+            if name in self.viewer.layers:
+                layer = self.viewer.layers[name]
+                warped = warp_slice_trakem2(get_layer_slice_2d(layer, z), src, dst, order=0)
+                set_layer_slice_2d(layer, z, np.rint(warped).astype(layer.data.dtype, copy=False))
+
+    def apply_nonlinear_current(self, _event=None):
+        self.apply_nonlinear_transform("current")
+
+    def apply_nonlinear_transform(self, direction="current"):
+        try:
+            src, dst = self.get_nonlinear_points()
+            _, model = nonlinear_transform_for_points(src, dst, self.get_deformation_target_shape())
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Nonlinear Transform", str(exc))
+            return
+        z = self.get_target_invitro_z()
+        max_z = self.target_z_spin.maximum()
+        if direction == "first":
+            indices = range(0, z + 1)
+        elif direction == "last":
+            indices = range(z, max_z + 1)
+        else:
+            indices = (z,)
+        saved_affines = {}
+        try:
+            for name in (INVITRO_IMAGE, INVITRO_MASK, INVITRO_MATCHES):
+                if name in self.viewer.layers:
+                    layer = self.viewer.layers[name]
+                    saved_affines[name] = self.get_layer_affine_matrix(layer)
+                    layer.affine = np.eye(4)
+            for index in indices:
+                self._apply_nonlinear_points_to_slice(index, src, dst)
+        except Exception as exc:
+            QMessageBox.warning(self, "Nonlinear Transform Failed", str(exc))
+            return
+        finally:
+            for name, affine in saved_affines.items():
+                if name in self.viewer.layers:
+                    self.viewer.layers[name].affine = affine
+                    self.viewer.layers[name].refresh()
+        count = len(tuple(indices)) if not isinstance(indices, tuple) else len(indices)
+        self.cancel_nonlinear_transform(silent=True)
+        print(f"Applied {model} nonlinear transform to {count} slice(s).")
+
+    def cancel_nonlinear_transform(self, _event=None, silent=False):
+        if not self._nonlinear_mode and not any(
+            name in self.viewer.layers for name in (TRAKEM_SRC_POINTS, TRAKEM_DST_POINTS)
+        ):
+            return
+        self._remove_nonlinear_layers()
+        self._nonlinear_mode = False
+        if not silent:
+            print("Cancelled nonlinear transform; image data was not changed.")
+
+
     def set_grid_spacing(self):
         self.grid_spacing = int(self.grid_spacing_spin.value())
 
@@ -1044,6 +1354,22 @@ class ControlPanel(QWidget):
             return
 
         spacing = int(self.grid_spacing_spin.value())
+        try:
+            ny, nx = deformation_grid_shape(shape, spacing)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Grid", str(e))
+            return
+        point_count = ny * nx
+        if point_count > MAX_DEFORMATION_GRID_POINTS:
+            safe_spacing = minimum_grid_spacing(shape)
+            QMessageBox.warning(
+                self,
+                "Grid Too Dense",
+                f"Spacing {spacing} creates {point_count:,} control points. "
+                f"Use spacing {safe_spacing} or larger (maximum "
+                f"{MAX_DEFORMATION_GRID_POINTS:,} points).",
+            )
+            return
         points_raw, ys, xs = make_regular_grid_points(shape, spacing)
         points_display = self.raw_points_to_display_points(points_raw)
 
@@ -1090,6 +1416,7 @@ class ControlPanel(QWidget):
 
         self._grid_ys = ys
         self._grid_xs = xs
+        self._grid_spacing = spacing
         print(
             f"Created deformation grid on the current display plane. "
             f"It will deform raw in-vitro slice z={self.get_target_invitro_z()} with {len(points_raw)} control points."
@@ -1097,7 +1424,7 @@ class ControlPanel(QWidget):
         print("Move points in the Deform Destination Points layer, then click Apply.")
 
     def update_deformation_grid_lines(self):
-        if DEFORM_DST_POINTS not in self.viewer.layers:
+        if DEFORM_SRC_POINTS not in self.viewer.layers or DEFORM_DST_POINTS not in self.viewer.layers:
             QMessageBox.warning(self, "Missing Points", "Create a deformation grid first.")
             return
 
@@ -1147,8 +1474,13 @@ class ControlPanel(QWidget):
         self._grid_src_raw = src.copy()
         self._grid_dst_raw = dst.copy()
 
-        if src.shape != dst.shape or src.shape[0] < 3:
-            raise RuntimeError("Source and destination points must have the same shape and at least 3 points.")
+        src, dst = validate_deformation_points(src, dst)
+        if hasattr(self, "_grid_ys") and hasattr(self, "_grid_xs"):
+            expected = len(self._grid_ys) * len(self._grid_xs)
+            if len(src) != expected:
+                raise RuntimeError(
+                    "Grid points were added or deleted. Recreate the grid and move existing red points only."
+                )
         return src, dst
 
     def apply_deformation_current_slice(self):
@@ -1168,7 +1500,11 @@ class ControlPanel(QWidget):
             return
 
         z = self.get_target_invitro_z()
-        self.apply_deformation_with_temporary_untransform(z, src, dst)
+        try:
+            self.apply_deformation_with_temporary_untransform(z, src, dst)
+        except Exception as e:
+            QMessageBox.warning(self, "Deformation Failed", str(e))
+            return
         self.save_current_slice_deformation(silent=True)
         self.update_deformation_grid_lines()
         print(
@@ -1203,10 +1539,17 @@ class ControlPanel(QWidget):
             return
 
         z = self.get_target_invitro_z()
+        ny = len(getattr(self, "_grid_ys", np.unique(src[:, 0])))
+        nx = len(getattr(self, "_grid_xs", np.unique(src[:, 1])))
+        if ny * nx != len(src):
+            if not silent:
+                QMessageBox.warning(self, "Invalid Grid", "Could not determine the grid row/column layout.")
+            return
         self.deformations[str(z)] = {
             "src_points_yx": src.tolist(),
             "dst_points_yx": dst.tolist(),
-            "grid_spacing": int(self.grid_spacing_spin.value()),
+            "grid_spacing": int(getattr(self, "_grid_spacing", self.grid_spacing_spin.value())),
+            "grid_shape": [ny, nx],
         }
         if not silent:
             print(f"Saved deformation in memory for slice z={z}.")
@@ -1241,9 +1584,24 @@ class ControlPanel(QWidget):
             QMessageBox.warning(self, "No Saved Deformation", f"No saved deformation found for slice z={z}.")
             return
 
-        src = np.asarray(info["src_points_yx"], dtype=float)
-        dst = np.asarray(info["dst_points_yx"], dtype=float)
-        self.apply_deformation_with_temporary_untransform(z, src, dst)
+        try:
+            src, dst = validate_deformation_points(
+                info["src_points_yx"], info["dst_points_yx"]
+            )
+            grid_shape = info.get("grid_shape")
+            if grid_shape is not None:
+                ny, nx = (int(value) for value in grid_shape)
+                if ny < 2 or nx < 2 or ny * nx != len(src):
+                    raise RuntimeError("The saved grid shape does not match its control points.")
+            else:
+                ny = len(np.unique(src[:, 0]))
+                nx = len(np.unique(src[:, 1]))
+                if ny * nx != len(src):
+                    raise RuntimeError("Could not reconstruct the saved grid topology.")
+            self.apply_deformation_with_temporary_untransform(z, src, dst)
+        except Exception as e:
+            QMessageBox.warning(self, "Saved Deformation Failed", str(e))
+            return
 
         # Show the loaded deformation grid so it can be edited further.
         for name in [DEFORM_SRC_POINTS, DEFORM_DST_POINTS, DEFORM_GRID]:
@@ -1259,10 +1617,12 @@ class ControlPanel(QWidget):
         self.viewer.layers[DEFORM_SRC_POINTS].editable = False
         self.viewer.add_points(dst_display, name=DEFORM_DST_POINTS, size=8, face_color="red", opacity=0.9, ndim=2, scale=point_scale)
 
-        ys = sorted(set(int(round(y)) for y in src[:, 0]))
-        xs = sorted(set(int(round(x)) for x in src[:, 1]))
+        ys = sorted(np.unique(src[:, 0]).tolist())
+        xs = sorted(np.unique(src[:, 1]).tolist())
         self._grid_ys = ys
         self._grid_xs = xs
+        self._grid_spacing = int(info.get("grid_spacing", self.grid_spacing_spin.value()))
+        self.grid_spacing_spin.setValue(self._grid_spacing)
         self.update_deformation_grid_lines()
         print(f"Applied saved deformation for slice z={z}.")
 
